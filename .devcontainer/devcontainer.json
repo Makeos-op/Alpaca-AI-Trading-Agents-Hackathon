@@ -1,0 +1,10 @@
+{
+  "name": "Dev Container",
+  "image": "python:3.12.14-bookworm",
+  "forwardPorts": [],
+  "customizations": {
+    "vscode": {
+      "extensions": []
+    }
+  }
+}
