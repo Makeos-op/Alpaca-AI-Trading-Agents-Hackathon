@@ -37,8 +37,8 @@ El container proporciona principalmente el entorno donde ejecutamos el código.
 
 Desde una terminal:
 
-    git clone <repository-url>
-    cd <project-folder>
+    git clone https://github.com/Makeos-op/Alpaca-AI-Trading-Agents-Hackathon.git
+    cd Alpaca-AI-Trading-Agents-Hackathon
 
 
 ## 2. Abrirlo con VS Code / VS Codium
