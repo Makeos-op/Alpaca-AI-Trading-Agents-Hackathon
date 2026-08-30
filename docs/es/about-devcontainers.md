@@ -117,34 +117,6 @@ Para subir los cambios:
 
 No necesitamos instalar Python ni las dependencias del proyecto directamente en nuestra máquina.
 
-
----
-
-# Añadir dependencias
-
-Las dependencias de Python se mantienen en:
-
-    requirements.txt
-
-Por ejemplo:
-
-    alpaca-py
-    pandas
-    numpy
-
-No basta con hacer:
-
-    pip install pandas
-
-porque ese cambio solo existiría en nuestro container actual.
-
-Debemos añadir la dependencia a:
-
-    requirements.txt
-
-y después reconstruir el container.
-
-
 ---
 
 # ¿Cuándo reconstruir el container?
@@ -156,10 +128,6 @@ Si modificamos:
 o:
 
     .devcontainer/devcontainer.json
-
-o añadimos nuevas dependencias a:
-
-    requirements.txt
 
 debemos reconstruir el container.
 
