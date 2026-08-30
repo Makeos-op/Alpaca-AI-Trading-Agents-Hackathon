@@ -244,8 +244,6 @@ Hay que reconstruir el container:
 
 El Dev Container se encarga de utilizar Docker por nosotros, asi que NO (normalmente).
 
----
-
 # Importante 
 
 Si algo es necesario para TODOS los miembros del equipo, no lo solucionemos únicamente instalándolo manualmente en nuestro container.
