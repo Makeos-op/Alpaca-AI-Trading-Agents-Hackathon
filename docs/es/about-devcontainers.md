@@ -228,9 +228,7 @@ Probablemente hiciste:
 
     pip install paquete
 
-pero no añadiste la dependencia a:
-
-    requirements.txt
+pero no añadiste la dependencia al container
 
 Añádela al archivo y reconstruye el container.
 
