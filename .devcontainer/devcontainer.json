@@ -1,10 +1,15 @@
 {
-  "name": "Dev Container",
-  "image": "python:3.12.14-bookworm",
-  "forwardPorts": [],
+  "name": "Hackathon Devcontainer",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
   "customizations": {
     "vscode": {
-      "extensions": []
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "charliermarsh.ruff"
+      ]
     }
   }
 }
