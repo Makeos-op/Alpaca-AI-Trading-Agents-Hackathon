@@ -243,6 +243,7 @@ Hay que reconstruir el container:
 ## "¿Tengo que usar Docker manualmente?"
 
 El Dev Container se encarga de utilizar Docker por nosotros, asi que NO (normalmente).
+
 ---
 # Importante 
 
