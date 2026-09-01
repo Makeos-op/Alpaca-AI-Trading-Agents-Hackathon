@@ -8,6 +8,5 @@ trading_client = TradingClient(os.getenv("API_KEY"),os.getenv("SECRET_KEY"),pape
 
 def get_account_snapshot(){
     tc_info= trading_client.get_account()
-    
 }
 
