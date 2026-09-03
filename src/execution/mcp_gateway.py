@@ -358,9 +358,19 @@ class StdioMCPTransport(BaseAlpacaTransport):
 
     def _build_env(self) -> dict[str, str]:
         env = os.environ.copy()
-        api_key = env.get("APCA_API_KEY_ID") or env.get("API_KEY") or env.get("ALPACA_API_KEY", "")
-        secret_key = env.get("APCA_API_SECRET_KEY") or env.get("SECRET_KEY") or env.get("ALPACA_SECRET_KEY", "")
-        toolsets = env.get("ALPACA_TOOLSETS") or os.getenv("ALPACA_TOOLSETS") or "account,trading,assets,options-data,stock-data"
+        # Un env override ya asignado en el constructor (self.env) tiene prioridad
+        # sobre el proceso actual — de lo contrario, pasar env={"ALPACA_TOOLSETS": ...}
+        # al constructor se descartaba silenciosamente en cualquier llamada posterior
+        # a _build_env().
+        existing = getattr(self, "env", None) or {}
+        api_key = existing.get("APCA_API_KEY_ID") or env.get("APCA_API_KEY_ID") or env.get("API_KEY") or env.get("ALPACA_API_KEY", "")
+        secret_key = existing.get("APCA_API_SECRET_KEY") or env.get("APCA_API_SECRET_KEY") or env.get("SECRET_KEY") or env.get("ALPACA_SECRET_KEY", "")
+        toolsets = (
+            existing.get("ALPACA_TOOLSETS")
+            or env.get("ALPACA_TOOLSETS")
+            or os.getenv("ALPACA_TOOLSETS")
+            or "account,trading,assets,options-data,stock-data"
+        )
 
         env.update({
             "ALPACA_API_KEY": api_key,
@@ -368,7 +378,7 @@ class StdioMCPTransport(BaseAlpacaTransport):
             "ALPACA_SECRET_KEY": secret_key,
             "APCA_API_SECRET_KEY": secret_key,
             "ALPACA_PAPER_TRADE": "true",
-            "APCA_API_BASE_URL": env.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets"),
+            "APCA_API_BASE_URL": existing.get("APCA_API_BASE_URL") or env.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets"),
             "ALPACA_TOOLSETS": toolsets,
         })
         return env
@@ -392,9 +402,15 @@ class StdioMCPTransport(BaseAlpacaTransport):
         self._connected = True
         logger.info(f"StdioMCPTransport inicializado con comando: {self.command} {' '.join(self.args)}")
 
-        # Poblar herramientas iniciales — nombres reales verificados vía tools/list
-        # contra el servidor oficial alpacahq/alpaca-mcp-server (72 tools totales).
-        self._tools_cache = [
+        self._tools_cache = self._default_tools_cache()
+
+    @staticmethod
+    def _default_tools_cache() -> list[MCPTool]:
+        """
+        Herramientas conocidas — nombres reales verificados vía tools/list contra
+        el servidor oficial alpacahq/alpaca-mcp-server (72 tools totales).
+        """
+        return [
             MCPTool(name="get_account_info", description="Consulta el balance y estado de la cuenta en Alpaca"),
             MCPTool(name="get_clock", description="Consulta el reloj y horarios de apertura/cierre de mercado"),
             MCPTool(name="get_calendar", description="Consulta el calendario de días de mercado"),
@@ -409,7 +425,13 @@ class StdioMCPTransport(BaseAlpacaTransport):
         return self._connected
 
     def list_tools(self) -> list[MCPTool]:
-        """Retorna las herramientas descubiertas en el servidor MCP."""
+        """
+        Retorna las herramientas descubiertas en el servidor MCP. No requiere
+        haber llamado initialize() antes — puebla el cache bajo demanda con la
+        misma lista estática, ya que es solo metadata local, no una llamada real.
+        """
+        if not self._tools_cache:
+            self._tools_cache = self._default_tools_cache()
         return list(self._tools_cache)
 
     def _read_line_safe(self, stream: Any, timeout: float) -> str:
@@ -758,6 +780,11 @@ class CLITransport(BaseAlpacaTransport):
 
     def __init__(self, binary_path: str = "/usr/bin/alpaca", env: Optional[dict[str, str]] = None):
         self.binary_path = binary_path
+        # Solo un env explícito del caller debe pesar como fuente de credenciales;
+        # el fallback automático es apenas una copia de os.environ en el momento de
+        # construir el objeto y queda obsoleto frente a cambios posteriores del
+        # entorno del proceso (incl. en tests que parchean os.environ luego).
+        self._env_explicit = env is not None
         self.env = env or self._build_env()
         self._connected = False
 
@@ -807,22 +834,23 @@ class CLITransport(BaseAlpacaTransport):
         if self.is_authenticated():
             return True
 
+        # os.environ (entorno vivo del proceso) tiene prioridad sobre self.env cuando
+        # este último fue solo un auto-fallback (copia de os.environ tomada al
+        # construir el transporte, que puede haber quedado obsoleta). Un env explícito
+        # pasado por el caller sí se respeta como override intencional.
         api_key = (
-            self.env.get("APCA_API_KEY_ID")
-            or self.env.get("ALPACA_API_KEY")
-            or self.env.get("API_KEY")
-            or os.getenv("APCA_API_KEY_ID")
+            os.getenv("APCA_API_KEY_ID")
             or os.getenv("ALPACA_API_KEY")
             or os.getenv("API_KEY")
         )
         secret_key = (
-            self.env.get("APCA_API_SECRET_KEY")
-            or self.env.get("ALPACA_SECRET_KEY")
-            or self.env.get("SECRET_KEY")
-            or os.getenv("APCA_API_SECRET_KEY")
+            os.getenv("APCA_API_SECRET_KEY")
             or os.getenv("ALPACA_SECRET_KEY")
             or os.getenv("SECRET_KEY")
         )
+        if self._env_explicit:
+            api_key = api_key or self.env.get("APCA_API_KEY_ID") or self.env.get("ALPACA_API_KEY") or self.env.get("API_KEY")
+            secret_key = secret_key or self.env.get("APCA_API_SECRET_KEY") or self.env.get("ALPACA_SECRET_KEY") or self.env.get("SECRET_KEY")
 
         if not api_key or not secret_key:
             logger.warning(
@@ -879,24 +907,16 @@ class CLITransport(BaseAlpacaTransport):
         """
         cmd = [self.binary_path] + args
 
-        # Inyección de credenciales en el entorno del proceso hijo
+        # Inyección de credenciales en el entorno del proceso hijo. os.environ vivo
+        # tiene prioridad sobre self.env (auto-fallback potencialmente obsoleto);
+        # un env explícito del caller se respeta vía self._env_explicit.
         env = self.env.copy()
-        api_key = (
-            env.get("APCA_API_KEY_ID")
-            or env.get("ALPACA_API_KEY")
-            or env.get("API_KEY")
-            or os.getenv("APCA_API_KEY_ID")
-            or os.getenv("ALPACA_API_KEY")
-            or os.getenv("API_KEY")
-        )
-        secret_key = (
-            env.get("APCA_API_SECRET_KEY")
-            or env.get("ALPACA_SECRET_KEY")
-            or env.get("SECRET_KEY")
-            or os.getenv("APCA_API_SECRET_KEY")
-            or os.getenv("ALPACA_SECRET_KEY")
-            or os.getenv("SECRET_KEY")
-        )
+        api_key = os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY") or os.getenv("API_KEY")
+        secret_key = os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY") or os.getenv("SECRET_KEY")
+        if not api_key and self._env_explicit:
+            api_key = env.get("APCA_API_KEY_ID") or env.get("ALPACA_API_KEY") or env.get("API_KEY")
+        if not secret_key and self._env_explicit:
+            secret_key = env.get("APCA_API_SECRET_KEY") or env.get("ALPACA_SECRET_KEY") or env.get("SECRET_KEY")
         if api_key:
             env["ALPACA_API_KEY"] = api_key
             env["APCA_API_KEY_ID"] = api_key
