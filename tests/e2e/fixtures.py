@@ -531,7 +531,7 @@ class Draft07SchemaValidator:
 # ==========================================
 
 class MockMCPStdioProtocolSimulator:
-    """Simulates stdio JSON-RPC protocol exchange with @alpacahq/mcp-server-alpaca."""
+    """Simulates stdio JSON-RPC protocol exchange with the official alpaca-mcp-server."""
 
     def __init__(self, fail_on_order: bool = False, disconnect_on_query: bool = False):
         self.fail_on_order = fail_on_order

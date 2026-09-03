@@ -3,7 +3,8 @@ src/execution/mcp_gateway.py
 
 Unified Alpaca MCP and CLI Gateway (Milestone 1: F1.1, F1.2, F1.3).
 Provides multi-transport connectivity to Alpaca Paper Trading:
-1. StdioMCPTransport: Communicates via stdio JSON-RPC 2.0 with @alpacahq/mcp-server-alpaca
+1. StdioMCPTransport: Communicates via stdio JSON-RPC 2.0 with the official
+   `alpaca-mcp-server` PyPI package (alpacahq/alpaca-mcp-server), launched via `uvx`
    (using Python mcp library with fallback to native stdio JSON-RPC protocol).
 2. CLITransport: Fallback transport executing /usr/bin/alpaca JSON commands.
 3. MockMCPTransport: Deterministic, in-memory transport for robust offline testing.
@@ -270,7 +271,8 @@ class BaseAlpacaTransport(ABC):
 class StdioMCPTransport(BaseAlpacaTransport):
     """
     Transporte que se comunica mediante el protocolo MCP (Model Context Protocol)
-    sobre stdio (JSON-RPC 2.0) con @alpacahq/mcp-server-alpaca (o alpaca-mcp-server).
+    sobre stdio (JSON-RPC 2.0) con el servidor oficial `alpaca-mcp-server`
+    (alpacahq/alpaca-mcp-server, distribuido en PyPI, lanzado vía `uvx`).
     Implementa tool discovery dinámico, reintentos con backoff y soporte robusto.
     """
 
@@ -283,8 +285,8 @@ class StdioMCPTransport(BaseAlpacaTransport):
         retry_delay_seconds: float = 1.0,
         timeout_seconds: float = 10.0,
     ):
-        self.command = command or os.getenv("ALPACA_MCP_COMMAND", "npx")
-        self.args = args or ["-y", "@alpacahq/mcp-server-alpaca"]
+        self.command = command or os.getenv("ALPACA_MCP_COMMAND", "uvx")
+        self.args = args or ["alpaca-mcp-server"]
         self.env = env or self._build_env()
         self.max_retries = max_retries
         self.retry_delay_seconds = retry_delay_seconds

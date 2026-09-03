@@ -5,7 +5,7 @@
 The **Alpaca AI Options Autonomous Trading System** is designed to provide institutional-grade safety, deterministic risk enforcement, and protocol compliance for autonomous options trading on Alpaca Paper Trading.
 
 The architecture solves two fundamental challenges in LLM-assisted and autonomous trading systems:
-1. **Protocol Rigidity**: Standardizing all broker communications through official MCP stdio (`@alpacahq/mcp-server-alpaca`) or Alpaca CLI (`/usr/bin/alpaca`), preventing fragmented, unauthorized direct REST calls.
+1. **Protocol Rigidity**: Standardizing all broker communications through official MCP stdio (`alpaca-mcp-server`, PyPI package alpacahq/alpaca-mcp-server) or Alpaca CLI (`/usr/bin/alpaca`), preventing fragmented, unauthorized direct REST calls.
 2. **Hallucination Interception**: Enforcing an infrangible, deterministic pre-trade risk guardrail (`RiskEngine`) with 100% Decimal precision that physically blocks out-of-bounds orders before any broker API interaction can occur.
 
 ---
@@ -22,7 +22,7 @@ The architecture solves two fundamental challenges in LLM-assisted and autonomou
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                    AlpacaGateway (Unified Facade)                       │
 │    src/execution/mcp_gateway.py                                         │
-│    ├── StdioMCPTransport (FastMCP stdio JSON-RPC 2.0 via npx)          │
+│    ├── StdioMCPTransport (FastMCP stdio JSON-RPC 2.0 via uvx)          │
 │    ├── CLITransport (Subprocess wrapper for /usr/bin/alpaca JSON)       │
 │    └── MockMCPTransport (Deterministic offline simulator)               │
 └──────────────────┬──────────────────────────────────┬───────────────────┘

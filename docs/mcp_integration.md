@@ -20,7 +20,7 @@ The gateway implements a multi-tier transport architecture via `BaseAlpacaTransp
 ```
 
 ### Tier 1: StdioMCPTransport
-- Communicates with `@alpacahq/mcp-server-alpaca` launched via `npx` (or Python FastMCP wrapper).
+- Communicates with `alpaca-mcp-server` (alpacahq/alpaca-mcp-server on PyPI) launched via `uvx`.
 - Implements JSON-RPC 2.0 protocol over `stdin`/`stdout`.
 - Features:
   * Dynamic FastMCP tool discovery (`tools/list`).
@@ -60,5 +60,5 @@ class AlpacaGateway:
 ### Auto-Negotiation Logic
 When `mode="auto"`:
 1. Gateway attempts initialization of `StdioMCPTransport`.
-2. If `npx` or Node.js environment is unavailable, it gracefully falls back to `CLITransport`.
+2. If `uvx` or a Python/uv environment is unavailable, it gracefully falls back to `CLITransport`.
 3. If `/usr/bin/alpaca` is unavailable (e.g. in test containers), it activates `MockMCPTransport`, logging a diagnostic notification.

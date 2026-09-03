@@ -1,11 +1,11 @@
 # Alpaca AI Options Autonomous Trading Agent
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![Alpaca MCP](https://img.shields.io/badge/Alpaca%20MCP-%40alpacahq%2Fmcp--server--alpaca-green.svg)](https://github.com/alpacahq/mcp-server-alpaca)
+[![Alpaca MCP](https://img.shields.io/badge/Alpaca%20MCP-alpaca--mcp--server-green.svg)](https://github.com/alpacahq/alpaca-mcp-server)
 [![Risk Engine](https://img.shields.io/badge/Risk%20Engine-5%25%20Infrangible%20Gate-red.svg)](src/risk/risk_engine.py)
 [![Audit Log](https://img.shields.io/badge/Audit%20Log-Draft--07%20JSONL-orange.svg)](logs/trades.jsonl)
 
-Autonomous options trading system integrating official Alpaca MCP Server (`@alpacahq/mcp-server-alpaca`) and Alpaca CLI via a deterministic pre-trade risk engine guardrail (5% portfolio rule) to eliminate hallucinated or hazardous trades.
+Autonomous options trading system integrating official Alpaca MCP Server (`alpaca-mcp-server`, PyPI package alpacahq/alpaca-mcp-server) and Alpaca CLI via a deterministic pre-trade risk engine guardrail (5% portfolio rule) to eliminate hallucinated or hazardous trades.
 
 ---
 
@@ -16,7 +16,7 @@ Autonomous options trading system integrating official Alpaca MCP Server (`@alpa
               │
               ▼
     [ AlpacaGateway ] (src/execution/mcp_gateway.py)
-       ├── StdioMCPTransport (@alpacahq/mcp-server-alpaca via stdio JSON-RPC 2.0)
+       ├── StdioMCPTransport (alpaca-mcp-server via stdio JSON-RPC 2.0, launched via uvx)
        ├── CLITransport (/usr/bin/alpaca --format json fallback)
        └── MockMCPTransport (offline deterministic testing & unit simulation)
               │
@@ -42,7 +42,7 @@ Autonomous options trading system integrating official Alpaca MCP Server (`@alpa
 ## 2. Core Features
 
 ### F1: Official Alpaca MCP & CLI Gateway (`src/execution/mcp_gateway.py`)
-- **Python Stdio MCP Client (`StdioMCPTransport`)**: Full JSON-RPC 2.0 protocol implementation connecting to `@alpacahq/mcp-server-alpaca` via standard I/O pipes. Supports automatic tool discovery, environment propagation, and resilient reconnection with exponential backoff on broken pipes.
+- **Python Stdio MCP Client (`StdioMCPTransport`)**: Full JSON-RPC 2.0 protocol implementation connecting to the official `alpaca-mcp-server` PyPI package via standard I/O pipes. Supports automatic tool discovery, environment propagation, and resilient reconnection with exponential backoff on broken pipes.
 - **Alpaca CLI Transport (`CLITransport`)**: Direct integration with the pre-compiled Go binary at `/usr/bin/alpaca`, parsing structured JSON responses for account snapshots, market clock, and order placement.
 - **Unified AlpacaGateway Facade**: Auto-negotiates the best available transport (`stdio` → `cli` → `mock`), eliminating direct ad-hoc REST SDK calls across `account.py`, `alpaca_executor.py`, and `main.py`.
 
