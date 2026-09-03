@@ -325,14 +325,15 @@ class StdioMCPTransport(BaseAlpacaTransport):
         self._connected = True
         logger.info(f"StdioMCPTransport inicializado con comando: {self.command} {' '.join(self.args)}")
 
-        # Poblar herramientas iniciales (FastMCP / OpenAPI standard)
+        # Poblar herramientas iniciales — nombres reales verificados vía tools/list
+        # contra el servidor oficial alpacahq/alpaca-mcp-server (72 tools totales).
         self._tools_cache = [
-            MCPTool(name="get_account", description="Consulta el balance y estado de la cuenta en Alpaca"),
+            MCPTool(name="get_account_info", description="Consulta el balance y estado de la cuenta en Alpaca"),
             MCPTool(name="get_clock", description="Consulta el reloj y horarios de apertura/cierre de mercado"),
             MCPTool(name="get_all_positions", description="Lista todas las posiciones abiertas"),
             MCPTool(name="get_option_contracts", description="Consulta contratos de opciones por subyacente"),
-            MCPTool(name="get_option_snapshots", description="Consulta cotizaciones en vivo y griegas de opciones"),
-            MCPTool(name="post_order", description="Envía una nueva orden de trading"),
+            MCPTool(name="get_option_snapshot", description="Consulta cotizaciones en vivo y griegas de opciones"),
+            MCPTool(name="place_option_order", description="Envía una nueva orden de opciones"),
         ]
 
     def is_connected(self) -> bool:
@@ -454,7 +455,7 @@ class StdioMCPTransport(BaseAlpacaTransport):
         )
 
     def _spawn_process(self) -> None:
-        """Inicia el subproceso del servidor MCP con stdio configurado."""
+        """Inicia el subproceso del servidor MCP con stdio configurado y realiza el handshake MCP."""
         try:
             self._proc = subprocess.Popen(
                 [self.command] + self.args,
@@ -472,6 +473,56 @@ class StdioMCPTransport(BaseAlpacaTransport):
         except Exception as exc:
             self._connected = False
             raise MCPTransportError(f"Fallo al iniciar el servidor MCP '{self.command}': {exc}") from exc
+
+        # Fuera del try anterior a propósito: errores de handshake (BrokenPipeError,
+        # MCPConnectionClosedError, TimeoutError) deben propagar con su tipo original
+        # para que el retry loop de _send_jsonrpc_request los reintente correctamente,
+        # en vez de quedar envueltos en un MCPTransportError no reintentable.
+        self._perform_handshake()
+
+    def _perform_handshake(self) -> None:
+        """
+        Realiza el handshake obligatorio del protocolo MCP (initialize ->
+        notifications/initialized) antes de cualquier tools/call. Un servidor MCP
+        real rechaza cualquier request previa a este handshake con error -32602.
+        """
+        if not (self._proc and self._proc.stdin and self._proc.stdout):
+            raise MCPConnectionClosedError("Proceso MCP no disponible para el handshake initialize")
+
+        init_req = {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "alpaca-ai-trading-agent", "version": "1.0.0"},
+            },
+        }
+        try:
+            self._proc.stdin.write(json.dumps(init_req) + "\n")
+            self._proc.stdin.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError) as write_err:
+            raise MCPConnectionClosedError(f"Fallo al escribir el handshake initialize: {write_err}") from write_err
+
+        line = self._read_line_safe(self._proc.stdout, timeout=self.timeout_seconds)
+        if not line:
+            raise MCPConnectionClosedError("El servidor MCP cerró la conexión durante el handshake initialize (EOF)")
+        try:
+            resp = json.loads(line)
+        except json.JSONDecodeError as jde:
+            raise MCPTransportError(f"Respuesta JSON inválida durante el handshake initialize: {jde}") from jde
+        if "error" in resp:
+            raise MCPTransportError(f"Servidor MCP rechazó el handshake initialize: {resp['error']}")
+
+        notif = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
+        try:
+            self._proc.stdin.write(json.dumps(notif) + "\n")
+            self._proc.stdin.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError) as write_err:
+            raise MCPConnectionClosedError(
+                f"Fallo al escribir notifications/initialized: {write_err}"
+            ) from write_err
 
     def _cleanup_process(self) -> None:
         """Termina y limpia el proceso hijo y sus descriptores asociados si está activo."""
@@ -498,16 +549,22 @@ class StdioMCPTransport(BaseAlpacaTransport):
         # Si la respuesta FastMCP viene como content blocks
         if isinstance(res, dict) and "content" in res:
             content_list = res.get("content", [])
+            error_text = None
             for item in content_list:
                 if isinstance(item, dict) and item.get("type") == "text":
+                    if res.get("isError"):
+                        error_text = item.get("text", "")
+                        continue
                     try:
                         return json.loads(item.get("text", "{}"))
                     except Exception:
                         return {"text": item.get("text", "")}
+            if res.get("isError"):
+                raise MCPTransportError(f"Herramienta MCP '{name}' devolvió un error: {error_text}")
         return res
 
     def get_account(self) -> dict[str, Any]:
-        return self.call_tool("get_account", {})
+        return self.call_tool("get_account_info", {})
 
     def get_clock(self) -> dict[str, Any]:
         return self.call_tool("get_clock", {})
@@ -545,9 +602,11 @@ class StdioMCPTransport(BaseAlpacaTransport):
         limit_price: Optional[Decimal] = None,
         client_order_id: Optional[str] = None,
     ) -> dict[str, Any]:
+        # place_option_order exige qty como string (no int) y no acepta claves
+        # fuera de su esquema (additionalProperties: False).
         args: dict[str, Any] = {
             "symbol": symbol,
-            "qty": qty,
+            "qty": str(qty),
             "side": side.lower(),
             "type": order_type.lower(),
             "time_in_force": time_in_force.lower(),
@@ -557,7 +616,7 @@ class StdioMCPTransport(BaseAlpacaTransport):
         if client_order_id:
             args["client_order_id"] = client_order_id
 
-        return self.call_tool("post_order", args)
+        return self.call_tool("place_option_order", args)
 
     def close(self) -> None:
         self._connected = False
