@@ -17,6 +17,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
 COPY tests/ ./tests/
+# La suite verifica (F1.5-01) que el packaging del repo incluya el Dockerfile
+# que compila el CLI oficial de Alpaca (tier 2 de R1) — se empaqueta también
+# aquí para que ese check de integridad siga siendo válido dentro de la imagen.
+COPY .devcontainer/ ./.devcontainer/
 
 # Gate de build: la suite debe pasar al 100% (R4) antes de que la imagen sea usable.
 # No requiere credenciales de Alpaca — corre 100% offline sobre MockMCPTransport.
