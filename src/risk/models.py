@@ -221,7 +221,7 @@ class RiskVerdict:
         # Sincronización de message y reasons
         if self.reasons and not self.message:
             object.__setattr__(self, "message", "; ".join(self.reasons))
-        elif self.message and not self.reasons:
+        elif self.message and not self.reasons and not self.is_approved:
             object.__setattr__(self, "reasons", [self.message])
 
         # Sincronización de audited_metrics y metrics_audited

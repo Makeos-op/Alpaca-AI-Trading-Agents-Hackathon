@@ -368,7 +368,7 @@ class TestTier1FeatureCoverage(unittest.TestCase):
         verdict = self.risk_engine.evaluate_trade(proposal, account)
         self.assertFalse(verdict.is_approved)
         self.assertGreater(verdict.trade_cost, Decimal("5000.00"))
-        self.assertIn("excede el límite del 5.0%", verdict.reasons[0])
+        self.assertIn("excede el límite del 5.000%", verdict.reasons[0])
 
     def test_f2_1_03_effective_budget_constrained_by_cash(self):
         """TC-T1-F2.1-03: Cash limitation overrides 5% nominal budget."""
@@ -438,7 +438,7 @@ class TestTier1FeatureCoverage(unittest.TestCase):
         proposal = TradeProposal(contract=contract, quantity=1, strategy_name="S")
         verdict = self.risk_engine.evaluate_trade(proposal, account)
         self.assertFalse(verdict.is_approved)
-        self.assertTrue(any("cero o inválidas" in r for r in verdict.reasons))
+        self.assertTrue(any("inválidas o cruzadas" in r for r in verdict.reasons))
 
     def test_f2_2_05_zero_ask_quote_rejected(self):
         """TC-T1-F2.2-05: Zero ask quote rejected."""
@@ -498,7 +498,7 @@ class TestTier1FeatureCoverage(unittest.TestCase):
             option_open_interest=50000,
         )
         self.assertTrue(score.is_tradable)
-        self.assertGreaterEqual(score.score, 4)
+        self.assertGreaterEqual(score.stars, 4)
 
     def test_f2_3_05_underlying_spread_threshold(self):
         """TC-T1-F2.3-05: Underlying spread > 1% fails tradability screening."""
@@ -543,9 +543,18 @@ class TestTier1FeatureCoverage(unittest.TestCase):
 
     def test_f2_4_04_delta_moneyness_classification(self):
         """TC-T1-F2.4-04: Moneyness classification by Delta."""
-        m_call_itm = classify_moneyness(delta=Decimal("0.75"), option_type=OptionType.CALL)
-        m_call_atm = classify_moneyness(delta=Decimal("0.50"), option_type=OptionType.CALL)
-        m_call_otm = classify_moneyness(delta=Decimal("0.25"), option_type=OptionType.CALL)
+        m_call_itm = classify_moneyness(
+            delta=Decimal("0.75"), contract_type=OptionType.CALL,
+            strike_price=Decimal("500.00"), underlying_price=Decimal("510.00"),
+        )
+        m_call_atm = classify_moneyness(
+            delta=Decimal("0.50"), contract_type=OptionType.CALL,
+            strike_price=Decimal("500.00"), underlying_price=Decimal("500.00"),
+        )
+        m_call_otm = classify_moneyness(
+            delta=Decimal("0.25"), contract_type=OptionType.CALL,
+            strike_price=Decimal("500.00"), underlying_price=Decimal("490.00"),
+        )
         self.assertEqual(m_call_itm.value, "ITM")
         self.assertEqual(m_call_atm.value, "ATM")
         self.assertEqual(m_call_otm.value, "OTM")
@@ -570,7 +579,7 @@ class TestTier1FeatureCoverage(unittest.TestCase):
         proposal = TradeProposal(contract=contract, quantity=1, strategy_name="S")
         verdict = self.risk_engine.evaluate_trade(proposal, account)
         self.assertFalse(verdict.is_approved)
-        self.assertTrue(any("congelada" in r for r in verdict.reasons))
+        self.assertTrue(any("CONGELADA" in r for r in verdict.reasons))
 
     def test_f2_5_02_inactive_account_rejection(self):
         """TC-T1-F2.5-02: Inactive account blocks trading."""

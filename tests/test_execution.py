@@ -366,8 +366,11 @@ class TestMCPTools(unittest.TestCase):
             "dte": 20,
             "bid_price": "2.10",
             "ask_price": "2.20",
+            "volume": 2000,
             "open_interest": 1500,
             "delta": "0.50",
+            "theta": "-0.04",
+            "implied_volatility": "0.20",
         }
 
         mock_snapshot = AccountSnapshot(

@@ -74,7 +74,7 @@ class TestTier4RealWorldScenarios(unittest.TestCase):
             option_open_interest=60000,
         )
         self.assertTrue(score.is_tradable)
-        self.assertGreaterEqual(score.score, 4)
+        self.assertGreaterEqual(score.stars, 4)
 
         # Step 3: Screen option chain and select optimal ATM Call contract
         c_atm = MockOptionContractFactory.create_valid_contract(
@@ -236,7 +236,7 @@ class TestTier4RealWorldScenarios(unittest.TestCase):
         verdict = self.risk_engine.evaluate_trade(proposal, account)
 
         self.assertFalse(verdict.is_approved)
-        self.assertIn("excede el límite del 5.0%", verdict.reasons[0])
+        self.assertIn("excede el límite del 5.000%", verdict.reasons[0])
 
         # Recommended quantity = $5,000 // $250 = 20 contracts
         self.assertEqual(verdict.recommended_quantity, 20)

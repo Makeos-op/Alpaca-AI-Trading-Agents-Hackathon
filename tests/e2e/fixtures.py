@@ -174,7 +174,7 @@ class MockOptionContractFactory:
         underlying_symbol: str = "SPY",
         contract_type: OptionType = OptionType.CALL,
         strike_price: str = "500.00",
-        bid_price: str = "2.10",
+        bid_price: Optional[str] = None,
         ask_price: str = "2.20",
         dte: int = 20,
         volume: int = 1500,
@@ -183,6 +183,16 @@ class MockOptionContractFactory:
         theta: str = "-0.04",
         implied_volatility: str = "0.1850",
     ) -> OptionContract:
+        if bid_price is None:
+            if ask_price == "2.20":
+                # Comportamiento histórico por defecto (spread de referencia $0.10).
+                bid_price = "2.10"
+            else:
+                # Deriva un bid ~2% por debajo del ask (spread pequeño y válido)
+                # cuando solo se sobreescribe ask_price, evitando spreads
+                # artificialmente anchos o cotizaciones cruzadas (ask <= bid).
+                ask_dec = Decimal(str(ask_price))
+                bid_price = str((ask_dec * Decimal("0.98")).quantize(Decimal("0.01")))
         return OptionContract.create(
             symbol=symbol,
             underlying_symbol=underlying_symbol,
@@ -305,6 +315,7 @@ class MockOptionContractFactory:
             open_interest=oi,
             delta="0.50",
             theta="-0.03",
+            implied_volatility="0.20",
         )
 
     @staticmethod

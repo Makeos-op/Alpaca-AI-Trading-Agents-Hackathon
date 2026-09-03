@@ -147,8 +147,10 @@ class OptionExecutor:
         order_type = "limit" if use_limit_order else "market"
 
         try:
-            # Compatibilidad con clientes/mocks legacy en pruebas unitarias
-            if self.trading_client is not None and hasattr(self.trading_client, "submit_order") and not hasattr(self.trading_client, "submit_option_order"):
+            # Compatibilidad con clientes/mocks legacy en pruebas unitarias.
+            # __init__ garantiza mutua exclusividad entre self.gateway y self.trading_client,
+            # por lo que basta con que trading_client esté presente para usar la ruta legacy.
+            if self.trading_client is not None:
                 order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
                 if use_limit_order:
                     req = LimitOrderRequest(
