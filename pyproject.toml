@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alpaca-ai-trading-agents"
+version = "0.1.0"
+description = "Autonomous options trading system with Alpaca MCP, CLI, and deterministic RiskEngine guardrail"
+authors = [{ name = "Hackathon Team" }]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "alpaca-py>=0.30.0",
+    "python-dotenv>=1.0.0",
+    "mcp>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

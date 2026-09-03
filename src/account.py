@@ -63,7 +63,7 @@ class AccountSnapshot:
 
     @classmethod
     def from_alpaca_account(cls, tc_info: Any) -> AccountSnapshot:
-        """Construye un AccountSnapshot a partir de un objeto de cuenta de Alpaca."""
+        """Construye un AccountSnapshot a partir de un objeto o diccionario de cuenta de Alpaca."""
         def _to_decimal(val: Any, default: str = "0.0") -> Decimal:
             if val is None:
                 return Decimal(default)
@@ -72,36 +72,47 @@ class AccountSnapshot:
             except (InvalidOperation, TypeError, ValueError):
                 return Decimal(default)
 
+        def _get(obj: Any, key: str, default: Any = None) -> Any:
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
         raw = {}
-        if hasattr(tc_info, "__dict__"):
+        if isinstance(tc_info, dict):
+            raw = {str(k): str(v) for k, v in tc_info.items()}
+        elif hasattr(tc_info, "__dict__"):
             raw = {k: str(v) for k, v in tc_info.__dict__.items() if not k.startswith("_")}
 
-        status_raw = getattr(tc_info, "status", "ACTIVE")
+        status_raw = _get(tc_info, "status", "ACTIVE")
         status_val = str(getattr(status_raw, "value", status_raw)).upper()
         
+        is_active_attr = _get(tc_info, "is_active", None)
         is_active = (
-            bool(getattr(tc_info, "is_active", False))
-            if getattr(tc_info, "is_active", None) is not None
+            bool(is_active_attr)
+            if is_active_attr is not None
             else (status_val in ["ACTIVE", "APPROVED", "ONBOARDING", "ACCOUNTSTATUS.ACTIVE"] or "ACTIVE" in status_val)
         )
         is_frozen = bool(
-            getattr(tc_info, "is_frozen", False) is True
-            or getattr(tc_info, "account_blocked", False) is True
+            _get(tc_info, "is_frozen", False) is True
+            or _get(tc_info, "account_blocked", False) is True
+            or _get(tc_info, "trading_blocked", False) is True
         )
 
+        acc_id = str(_get(tc_info, "account_id", _get(tc_info, "id", "")) or "")
+
         return cls(
-            account_id=str(getattr(tc_info, "account_id", getattr(tc_info, "id", ""))),
-            cash=_to_decimal(getattr(tc_info, "cash", 0)),
-            portfolio_value=_to_decimal(getattr(tc_info, "portfolio_value", 0)),
-            buying_power=_to_decimal(getattr(tc_info, "buying_power", 0)),
-            equity=_to_decimal(getattr(tc_info, "equity", 0)),
-            long_market_value=_to_decimal(getattr(tc_info, "long_market_value", 0)),
-            short_market_value=_to_decimal(getattr(tc_info, "short_market_value", 0)),
-            initial_margin=_to_decimal(getattr(tc_info, "initial_margin", 0)),
-            maintenance_margin=_to_decimal(getattr(tc_info, "maintenance_margin", 0)),
-            daytrading_buying_power=_to_decimal(getattr(tc_info, "daytrading_buying_power", 0)),
-            daytrading_count=int(getattr(tc_info, "daytrading_count", 0) or 0),
-            is_daytrader=bool(getattr(tc_info, "is_daytrader", False)),
+            account_id=acc_id,
+            cash=_to_decimal(_get(tc_info, "cash", 0)),
+            portfolio_value=_to_decimal(_get(tc_info, "portfolio_value", 0)),
+            buying_power=_to_decimal(_get(tc_info, "buying_power", 0)),
+            equity=_to_decimal(_get(tc_info, "equity", 0)),
+            long_market_value=_to_decimal(_get(tc_info, "long_market_value", 0)),
+            short_market_value=_to_decimal(_get(tc_info, "short_market_value", 0)),
+            initial_margin=_to_decimal(_get(tc_info, "initial_margin", 0)),
+            maintenance_margin=_to_decimal(_get(tc_info, "maintenance_margin", 0)),
+            daytrading_buying_power=_to_decimal(_get(tc_info, "daytrading_buying_power", 0)),
+            daytrading_count=int(_get(tc_info, "daytrading_count", _get(tc_info, "daytrade_count", 0)) or 0),
+            is_daytrader=bool(_get(tc_info, "is_daytrader", False)),
             is_active=bool(is_active),
             is_frozen=bool(is_frozen),
             raw_data=raw,
@@ -162,15 +173,34 @@ def get_trading_client(
     return TradingClient(api_key=key, secret_key=secret, paper=paper)
 
 
-def get_account_snapshot(client: Optional[TradingClient] = None) -> AccountSnapshot:
+def get_account_snapshot(client: Optional[Any] = None) -> AccountSnapshot:
     """
-    Obtiene el snapshot actual de la cuenta en Alpaca.
+    Obtiene el snapshot actual de la cuenta en Alpaca utilizando AlpacaGateway
+    (eliminando llamadas directas ad-hoc REST de TradingClient).
+    Mantiene compatibilidad con clientes mock inyectados en tests unitarios.
     """
     if client is None:
-        client = get_trading_client()
+        try:
+            from src.execution.mcp_gateway import AlpacaGateway
+            gateway = AlpacaGateway()
+            return gateway.get_account()
+        except AccountError:
+            raise
+        except Exception as exc:
+            raise AccountConnectionError(f"Error al obtener información de cuenta vía AlpacaGateway: {exc}") from exc
+
+    # Si se pasó un cliente explícito (AlpacaGateway, TradingClient o Mock)
+    try:
+        from src.execution.mcp_gateway import AlpacaGateway
+        if isinstance(client, AlpacaGateway):
+            return client.get_account()
+    except ImportError:
+        pass
 
     try:
         alpaca_acc = client.get_account()
+        if isinstance(alpaca_acc, AccountSnapshot):
+            return alpaca_acc
         return AccountSnapshot.from_alpaca_account(alpaca_acc)
     except AccountError:
         raise
@@ -195,15 +225,39 @@ class MarketClockInfo:
         }
 
 
-def get_market_clock(client: Optional[TradingClient] = None) -> MarketClockInfo:
+# Alias de MarketClockInfo para cumplimiento con Interface Contract
+MarketClock = MarketClockInfo
+
+
+def get_market_clock(client: Optional[Any] = None) -> MarketClockInfo:
     """
-    Consulta el estado en vivo del reloj del mercado en Alpaca.
+    Consulta el estado en vivo del reloj del mercado en Alpaca a través de AlpacaGateway.
+    Mantiene compatibilidad con clientes mock inyectados en tests unitarios.
     """
     if client is None:
-        client = get_trading_client()
+        try:
+            from src.execution.mcp_gateway import AlpacaGateway
+            gateway = AlpacaGateway()
+            return gateway.get_clock()
+        except Exception:
+            return MarketClockInfo(
+                is_open=False,
+                next_open="09:30 AM EST",
+                next_close="04:00 PM EST",
+                timestamp="",
+            )
+
+    try:
+        from src.execution.mcp_gateway import AlpacaGateway
+        if isinstance(client, AlpacaGateway):
+            return client.get_clock()
+    except ImportError:
+        pass
 
     try:
         clock = client.get_clock()
+        if isinstance(clock, MarketClockInfo):
+            return clock
         return MarketClockInfo(
             is_open=bool(getattr(clock, "is_open", False)),
             next_open=str(getattr(clock, "next_open", "")),

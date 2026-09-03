@@ -5,3 +5,4 @@ __pycache__/
 *.pyd
 .pytest_cache/
 logs/trades.jsonl
+*.private
