@@ -1,0 +1,16 @@
+services:
+  alpaca-agent:
+    build: .
+    image: alpaca-ai-trading-agent:latest
+    container_name: alpaca-agent
+    env_file:
+      - .env
+    environment:
+      APCA_API_BASE_URL: https://paper-api.alpaca.markets
+    volumes:
+      - ./logs:/app/logs
+    # Override para otros modos, ej.:
+    #   docker compose run --rm alpaca-agent --mode dry-run
+    #   docker compose run --rm alpaca-agent --mode scan
+    command: ["--mode", "loop", "--interval", "300"]
+    restart: unless-stopped
