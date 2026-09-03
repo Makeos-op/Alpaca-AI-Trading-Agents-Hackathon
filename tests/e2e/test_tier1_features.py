@@ -125,6 +125,20 @@ class TestTier1FeatureCoverage(unittest.TestCase):
         self.assertIn("error", resp)
         self.assertEqual(resp["error"]["code"], -32700)
 
+    def test_f1_1_06_mcp_toolsets_assets_enables_clock_and_calendar(self):
+        """TC-T1-F1.1-06 (R1): MCP stdio environment includes 'assets' toolset enabling get_clock & get_calendar."""
+        req_clock = json.dumps({"jsonrpc": "2.0", "id": 10, "method": "tools/call", "params": {"name": "get_clock"}})
+        resp_clock = json.loads(self.mcp_sim.handle_request(req_clock))
+        self.assertNotIn("error", resp_clock)
+        self.assertTrue(resp_clock["result"]["is_open"])
+
+        req_cal = json.dumps({"jsonrpc": "2.0", "id": 11, "method": "tools/call", "params": {"name": "get_calendar"}})
+        resp_cal = json.loads(self.mcp_sim.handle_request(req_cal))
+        self.assertNotIn("error", resp_cal)
+        self.assertIsInstance(resp_cal["result"], list)
+        self.assertGreater(len(resp_cal["result"]), 0)
+        self.assertIn("date", resp_cal["result"][0])
+
     # =========================================================================
     # Feature 1.2: Alpaca CLI Transport
     # =========================================================================
@@ -166,6 +180,17 @@ class TestTier1FeatureCoverage(unittest.TestCase):
         code, stdout, stderr = MockCLIRunnerSimulator.run_command(["nonexistent_subcommand"])
         self.assertEqual(code, 1)
         self.assertIn("Unknown CLI command", stderr)
+
+    def test_f1_2_06_cli_profile_auto_auth(self):
+        """TC-T1-F1.2-06 (R2): CLI auto-auth via alpaca profile login --api-key non-interactive."""
+        code, stdout, stderr = MockCLIRunnerSimulator.run_command(["profile", "login", "--api-key"])
+        self.assertEqual(code, 0)
+        self.assertIn("logged in successfully", stdout)
+        # Check that subsequent account get works
+        code_acc, stdout_acc, _ = MockCLIRunnerSimulator.run_command(["account", "get"])
+        self.assertEqual(code_acc, 0)
+        data = json.loads(stdout_acc)
+        self.assertEqual(data["id"], "acc-cli-12345")
 
     # =========================================================================
     # Feature 1.3: Unified AlpacaGateway
@@ -657,7 +682,7 @@ class TestTier1FeatureCoverage(unittest.TestCase):
 
     def test_f3_1_02_scan_mode_routing(self):
         """TC-T1-F3.1-02: Scan mode configuration routing."""
-        modes = ["scan", "dry-run", "loop"]
+        modes = ["scan", "dry-run", "loop", "scalp"]
         selected_mode = "scan"
         self.assertIn(selected_mode, modes)
 
@@ -685,6 +710,40 @@ class TestTier1FeatureCoverage(unittest.TestCase):
         contract = MockOptionContractFactory.create_valid_contract()
         with self.assertRaises(ValueError):
             TradeProposal(contract=contract, quantity=0, strategy_name="ZeroQty")
+
+    def test_f3_1_06_scalp_mode_configuration_and_quick_trade(self):
+        """TC-T1-F3.1-06 (R3): Scalp mode routing, timeframe validation, and deterministic quick-trade."""
+        modes = ["scan", "dry-run", "loop", "scalp"]
+        self.assertIn("scalp", modes)
+
+        # Propuesta determinista de 1 acción para quick-trade
+        quick_trade_prop = TradeProposal(
+            symbol="SPY",
+            quantity=1,
+            action="BUY",
+            asset_class="equity",
+            price=Decimal("500.00"),
+            ask_price=Decimal("500.05"),
+            bid_price=Decimal("500.00"),
+            strategy_name="QuickTradeDeterministic",
+        )
+        snap = MockAccountSnapshotFactory.create_healthy_account()
+        verdict = self.risk_engine.evaluate_proposal(quick_trade_prop, snap)
+        self.assertTrue(verdict.is_approved)
+        self.assertEqual(verdict.trade_cost, Decimal("500.05"))
+
+        # Registro en bitácora auditable con modo scalp
+        entry = self.logger.log_executed_trade(
+            proposal=quick_trade_prop,
+            verdict=verdict,
+            order_id="scalp-qt-12345",
+            fill_price=Decimal("500.05"),
+            mode="scalp",
+        )
+        self.assertEqual(entry.mode, "scalp")
+        self.assertEqual(entry.execution_status, "FILLED")
+        is_valid, errors = Draft07SchemaValidator.validate(entry.to_dict())
+        self.assertTrue(is_valid, f"Errores en esquema Draft-07 para scalp: {errors}")
 
     # =========================================================================
     # Feature 3.2: Structured JSONL Logging

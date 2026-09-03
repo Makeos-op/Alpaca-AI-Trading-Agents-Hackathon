@@ -107,15 +107,25 @@ class OptionExecutor:
         contract = proposal.contract
         is_dry = self.dry_run if dry_run is None else dry_run
         current_mode = "dry-run" if is_dry else self.mode
+        is_equity = (
+            getattr(proposal, "is_equity", False)
+            or (getattr(proposal, "asset_class", "option") or "option").lower() in ("equity", "stock")
+            or contract is None
+        )
+        target_symbol = (
+            getattr(proposal, "target_symbol", "")
+            or getattr(proposal, "symbol", "")
+            or (contract.symbol if contract else "")
+        )
 
-        # 1. Guardrail Infranqueable: Rechazo de Risk Engine
+        # 1. Guardrail Infranqueable: Rechazo de Risk Engine (CERO llamadas a broker)
         if not verdict.is_approved:
             self.logger.log_rejected_trade(proposal, verdict, mode=current_mode)
             reasons_str = "; ".join(verdict.reasons) if verdict.reasons else (verdict.message or str(verdict.reason_code))
             return ExecutionResult(
                 success=False,
                 order_id=None,
-                symbol=contract.symbol,
+                symbol=target_symbol,
                 quantity=proposal.quantity,
                 status="REJECTED",
                 error_message=f"Orden cancelada por el Risk Engine: {reasons_str}",
@@ -124,22 +134,27 @@ class OptionExecutor:
         # 2. Modo Dry-Run: Simulación de ejecución con cero mutaciones en broker
         if is_dry:
             sim_order_id = f"dry-run-order-{uuid.uuid4().hex[:8]}"
-            fill_price = limit_price or contract.ask_price
+            ref_price = (
+                limit_price
+                or (contract.ask_price if contract else None)
+                or getattr(proposal, "ask_price", None)
+                or getattr(proposal, "price", Decimal("100.00"))
+            )
             self.logger.log_executed_trade(
                 proposal=proposal,
                 verdict=verdict,
                 order_id=sim_order_id,
-                fill_price=fill_price,
+                fill_price=ref_price,
                 status="SIMULATED",
                 mode="dry-run",
             )
             return ExecutionResult(
                 success=True,
                 order_id=sim_order_id,
-                symbol=contract.symbol,
+                symbol=target_symbol,
                 quantity=proposal.quantity,
                 status="SIMULATED",
-                filled_avg_price=fill_price,
+                filled_avg_price=ref_price,
             )
 
         # 3. Ejecución Real / Paper Trading vía Gateway
@@ -152,17 +167,22 @@ class OptionExecutor:
             # por lo que basta con que trading_client esté presente para usar la ruta legacy.
             if self.trading_client is not None:
                 order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
+                ref_ask = (
+                    contract.ask_price
+                    if contract
+                    else (getattr(proposal, "ask_price", None) or getattr(proposal, "price", Decimal("100.00")))
+                )
                 if use_limit_order:
                     req = LimitOrderRequest(
-                        symbol=contract.symbol,
+                        symbol=target_symbol,
                         qty=proposal.quantity,
                         side=order_side,
                         time_in_force=TimeInForce.DAY,
-                        limit_price=float(limit_price or contract.ask_price),
+                        limit_price=float(limit_price or ref_ask),
                     )
                 else:
                     req = MarketOrderRequest(
-                        symbol=contract.symbol,
+                        symbol=target_symbol,
                         qty=proposal.quantity,
                         side=order_side,
                         time_in_force=TimeInForce.DAY,
@@ -171,20 +191,57 @@ class OptionExecutor:
                 order_id = str(getattr(order, "id", getattr(order, "client_order_id", "order-legacy")))
                 status = str(getattr(order, "status", "FILLED")).upper()
                 fill_raw = getattr(order, "filled_avg_price", getattr(order, "limit_price", None))
-                fill_price = to_decimal(fill_raw) if fill_raw else contract.ask_price
+                fill_price = to_decimal(fill_raw) if fill_raw else ref_ask
             else:
                 gw = self._get_gateway()
-                order_dict = gw.submit_option_order(
-                    symbol=contract.symbol,
-                    qty=proposal.quantity,
-                    side=side,
-                    time_in_force="day",
-                    order_type=order_type,
-                    limit_price=limit_price,
+                ref_ask = (
+                    contract.ask_price
+                    if contract
+                    else (getattr(proposal, "ask_price", None) or getattr(proposal, "price", Decimal("100.00")))
                 )
+
+                if is_equity:
+                    if hasattr(gw, "submit_stock_order"):
+                        order_dict = gw.submit_stock_order(
+                            symbol=target_symbol,
+                            qty=proposal.quantity,
+                            side=side,
+                            time_in_force="day",
+                            order_type=order_type,
+                            limit_price=limit_price,
+                        )
+                    else:
+                        order_dict = gw.submit_order(
+                            symbol=target_symbol,
+                            qty=proposal.quantity,
+                            side=side,
+                            time_in_force="day",
+                            order_type=order_type,
+                            limit_price=limit_price,
+                        )
+                else:
+                    if hasattr(gw, "submit_option_order"):
+                        order_dict = gw.submit_option_order(
+                            symbol=target_symbol,
+                            qty=proposal.quantity,
+                            side=side,
+                            time_in_force="day",
+                            order_type=order_type,
+                            limit_price=limit_price,
+                        )
+                    else:
+                        order_dict = gw.submit_order(
+                            symbol=target_symbol,
+                            qty=proposal.quantity,
+                            side=side,
+                            time_in_force="day",
+                            order_type=order_type,
+                            limit_price=limit_price,
+                        )
+
                 order_id = str(order_dict.get("id") or order_dict.get("client_order_id") or f"order-{uuid.uuid4().hex[:8]}")
                 status = str(order_dict.get("status", "FILLED")).upper()
-                raw_fill = order_dict.get("filled_avg_price") or limit_price or contract.ask_price
+                raw_fill = order_dict.get("filled_avg_price") or limit_price or ref_ask
                 fill_price = to_decimal(raw_fill)
 
             self.logger.log_executed_trade(
@@ -198,14 +255,15 @@ class OptionExecutor:
             return ExecutionResult(
                 success=True,
                 order_id=order_id,
-                symbol=contract.symbol,
+                symbol=target_symbol,
                 quantity=proposal.quantity,
                 status=status,
                 filled_avg_price=fill_price,
             )
 
         except Exception as exc:
-            error_msg = f"Error al emitir orden de opciones en Alpaca: {exc}"
+            asset_label = "acciones" if is_equity else "opciones"
+            error_msg = f"Error al emitir orden de {asset_label} en Alpaca: {exc}"
             self.logger.log_rejected_trade(
                 proposal=proposal,
                 verdict=RiskVerdict(
@@ -221,11 +279,83 @@ class OptionExecutor:
             return ExecutionResult(
                 success=False,
                 order_id=None,
-                symbol=contract.symbol,
+                symbol=target_symbol,
                 quantity=proposal.quantity,
                 status="ERROR",
                 error_message=error_msg,
             )
+
+    def execute_equity_trade(
+        self,
+        proposal: TradeProposal,
+        verdict: RiskVerdict,
+        use_limit_order: bool = False,
+        limit_price: Optional[Decimal] = None,
+        dry_run: Optional[bool] = None,
+    ) -> ExecutionResult:
+        """Método específico para ejecutar órdenes de acciones o ETFs aprobadas."""
+        return self.execute_approved_trade(
+            proposal=proposal,
+            verdict=verdict,
+            use_limit_order=use_limit_order,
+            limit_price=limit_price,
+            dry_run=dry_run,
+        )
+
+    def fallback_to_equity(
+        self,
+        proposal: TradeProposal,
+        account: Optional[AccountSnapshot] = None,
+        risk_engine: Optional[RiskEngine] = None,
+        underlying_price: Optional[Decimal | float | str] = None,
+        fallback_symbol: Optional[str] = None,
+        quantity: Optional[int] = None,
+        use_limit_order: bool = False,
+        limit_price: Optional[Decimal] = None,
+        dry_run: Optional[bool] = None,
+    ) -> ExecutionResult:
+        """
+        Fallback determinista a acciones/ETFs (ej. SPY, AAPL) cuando los contratos de
+        opciones no están disponibles, son ilíquidos o el mercado de opciones está cerrado.
+        Evalúa la orden a través del RiskEngine y la ejecuta únicamente si es aprobada.
+        """
+        sym = (
+            fallback_symbol
+            or getattr(proposal, "underlying_symbol", None)
+            or getattr(proposal, "symbol", None)
+            or (proposal.contract.underlying_symbol if proposal.contract else "SPY")
+        )
+        re = risk_engine or RiskEngine()
+        snap = account or self._get_gateway().get_account()
+
+        u_price = to_decimal(underlying_price) if underlying_price is not None else Decimal("500.00")
+        qty = quantity if quantity is not None and quantity > 0 else max(1, proposal.quantity)
+
+        equity_proposal = TradeProposal(
+            symbol=sym,
+            quantity=qty,
+            strategy_name=f"{proposal.strategy_name}_EquityFallback",
+            action=proposal.action or "BUY",
+            asset_class="equity",
+            price=u_price,
+            ask_price=u_price,
+            bid_price=u_price,
+            rationale=f"Fallback a acciones por indisponibilidad de opciones: {sym}",
+        )
+
+        verdict = re.evaluate_proposal(equity_proposal, snap)
+        return self.execute_approved_trade(
+            proposal=equity_proposal,
+            verdict=verdict,
+            use_limit_order=use_limit_order,
+            limit_price=limit_price,
+            dry_run=dry_run,
+        )
+
+
+# Alias unificados para la capa de ejecución multi-activo
+AlpacaOrderExecutor = OptionExecutor
+AlpacaExecutor = OptionExecutor
 
 
 # ==========================================

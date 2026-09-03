@@ -146,27 +146,84 @@ class RiskConfig:
 
 @dataclass(frozen=True)
 class TradeProposal:
-    """Propuesta estructurada de trade emitida por una estrategia o agente."""
-    contract: OptionContract
-    quantity: int
-    strategy_name: str
+    """
+    Propuesta estructurada de trade emitida por una estrategia o agente.
+    Soporta operaciones multi-activo: contratos de opciones ('option') y acciones/ETFs ('equity' / 'stock').
+    """
+    contract: Optional[OptionContract] = None
+    quantity: int = 1
+    strategy_name: str = ""
     action: str = "BUY"  # BUY / SELL
     max_slippage_pct: Decimal = Decimal("0.02")  # 2% de tolerancia por defecto
     rationale: str = ""
     limit_price: Optional[Decimal] = None
     side: Optional[str] = None
+    asset_class: str = "option"  # "option" | "equity" | "stock"
+    symbol: Optional[str] = None
+    underlying_symbol: Optional[str] = None
+    price: Optional[Decimal] = None
+    ask_price: Optional[Decimal] = None
+    bid_price: Optional[Decimal] = None
+    signal_type: Optional[str] = None
+    confidence: Optional[Any] = None
 
     def __post_init__(self):
         if self.quantity <= 0:
-            raise ValueError("La cantidad de contratos debe ser mayor a 0")
+            raise ValueError("La cantidad de contratos o acciones debe ser mayor a 0")
         if self.side and not self.action:
             object.__setattr__(self, "action", self.side.upper())
         elif self.action and not self.side:
             object.__setattr__(self, "side", self.action.upper())
 
+        # Normalizar asset_class
+        norm_asset_class = (self.asset_class or "option").lower()
+        object.__setattr__(self, "asset_class", norm_asset_class)
+
+        # Sincronizar symbol desde contract si no fue especificado directamente
+        if not self.symbol and self.contract is not None:
+            sym = getattr(self.contract, "symbol", "")
+            object.__setattr__(self, "symbol", sym)
+
+        # Sincronizar underlying_symbol
+        if not self.underlying_symbol:
+            if self.contract is not None:
+                u_sym = getattr(self.contract, "underlying_symbol", self.symbol or "")
+                object.__setattr__(self, "underlying_symbol", u_sym)
+            elif self.symbol:
+                object.__setattr__(self, "underlying_symbol", self.symbol)
+
+        # Convertir precios opcionales a Decimal si fueron suministrados como float o str
+        if self.price is not None and not isinstance(self.price, Decimal):
+            object.__setattr__(self, "price", to_decimal(self.price))
+        if self.ask_price is not None and not isinstance(self.ask_price, Decimal):
+            object.__setattr__(self, "ask_price", to_decimal(self.ask_price))
+        if self.bid_price is not None and not isinstance(self.bid_price, Decimal):
+            object.__setattr__(self, "bid_price", to_decimal(self.bid_price))
+        if self.limit_price is not None and not isinstance(self.limit_price, Decimal):
+            object.__setattr__(self, "limit_price", to_decimal(self.limit_price))
+
+    @property
+    def is_equity(self) -> bool:
+        """Indica si la propuesta corresponde a acciones o ETFs."""
+        return self.asset_class in ("equity", "stock")
+
+    @property
+    def is_option(self) -> bool:
+        """Indica si la propuesta corresponde a un contrato de opciones."""
+        return not self.is_equity
+
+    @property
+    def target_symbol(self) -> str:
+        """Retorna el símbolo objetivo de la orden (símbolo OCC o ticker de acción)."""
+        if self.symbol:
+            return self.symbol
+        if self.contract and hasattr(self.contract, "symbol"):
+            return self.contract.symbol
+        return ""
+
     def to_dict(self) -> dict[str, Any]:
         return {
-            "symbol": self.contract.symbol if self.contract else "",
+            "symbol": self.target_symbol,
             "quantity": self.quantity,
             "strategy_name": self.strategy_name,
             "action": self.action,
@@ -174,6 +231,7 @@ class TradeProposal:
             "max_slippage_pct": str(self.max_slippage_pct),
             "rationale": self.rationale,
             "limit_price": str(self.limit_price) if self.limit_price is not None else None,
+            "asset_class": self.asset_class,
         }
 
 

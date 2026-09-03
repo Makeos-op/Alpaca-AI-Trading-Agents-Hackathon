@@ -88,6 +88,11 @@ class OptionOrderError(GatewayError):
     pass
 
 
+class StockOrderError(GatewayError):
+    """Error al enviar o procesar una orden de acciones o ETFs."""
+    pass
+
+
 # ==========================================
 # Modelos de Datos del Gateway & Herramientas
 # ==========================================
@@ -105,6 +110,12 @@ class MCPTool:
 # ==========================================
 
 _OCC_REGEX = re.compile(r"^([A-Z]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})$")
+
+def is_occ_symbol(symbol: str) -> bool:
+    """Retorna True si la cadena dada cumple el formato estándar de símbolo de opción OCC/OSI."""
+    if not isinstance(symbol, str):
+        return False
+    return bool(_OCC_REGEX.match(symbol.strip()))
 
 def parse_occ_symbol(symbol: str) -> dict[str, Any]:
     """
@@ -228,6 +239,10 @@ class BaseAlpacaTransport(ABC):
         """Obtiene el estado del reloj de mercado en formato diccionario."""
         pass
 
+    def get_calendar(self, start: Optional[str] = None, end: Optional[str] = None) -> list[dict[str, Any]]:
+        """Obtiene el calendario de mercado para un rango de fechas."""
+        return []
+
     @abstractmethod
     def get_positions(self) -> list[dict[str, Any]]:
         """Obtiene las posiciones abiertas."""
@@ -283,10 +298,13 @@ class StdioMCPTransport(BaseAlpacaTransport):
         env: Optional[dict[str, str]] = None,
         max_retries: int = 3,
         retry_delay_seconds: float = 1.0,
-        timeout_seconds: float = 10.0,
+        timeout_seconds: float = 15.0,
     ):
-        self.command = command or os.getenv("ALPACA_MCP_COMMAND", "uvx")
-        self.args = args or ["alpaca-mcp-server"]
+        self._user_command = command
+        self._user_args = args
+        resolved_cmd, resolved_args = self._resolve_command(command, args)
+        self.command = resolved_cmd
+        self.args = resolved_args
         self.env = env or self._build_env()
         self.max_retries = max_retries
         self.retry_delay_seconds = retry_delay_seconds
@@ -294,13 +312,55 @@ class StdioMCPTransport(BaseAlpacaTransport):
         self._connected = False
         self._tools_cache: list[MCPTool] = []
         self._proc: Optional[subprocess.Popen] = None
+        self._stderr_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._req_id = 0
+
+    @classmethod
+    def _find_alternative_command(cls) -> tuple[Optional[str], list[str]]:
+        """Busca binarios o comandos alternativos para alpaca-mcp-server si uvx no está disponible."""
+        which_alpaca = shutil.which("alpaca-mcp-server")
+        if which_alpaca:
+            return which_alpaca, []
+        if os.path.isfile("/usr/local/bin/alpaca-mcp-server") and os.access("/usr/local/bin/alpaca-mcp-server", os.X_OK):
+            return "/usr/local/bin/alpaca-mcp-server", []
+        try:
+            import importlib.util
+            if importlib.util.find_spec("alpaca_mcp_server") is not None:
+                return sys.executable, ["-m", "alpaca_mcp_server"]
+        except Exception:
+            pass
+        which_npx = shutil.which("npx")
+        if which_npx:
+            return which_npx, ["-y", "@alpacahq/mcp-server-alpaca"]
+        return None, []
+
+    @classmethod
+    def _resolve_command(cls, command: Optional[str], args: Optional[list[str]]) -> tuple[str, list[str]]:
+        """Resuelve inteligentemente el binario y argumentos MCP a utilizar."""
+        env_cmd = os.getenv("ALPACA_MCP_COMMAND")
+        if env_cmd:
+            env_args = os.getenv("ALPACA_MCP_ARGS")
+            resolved_args = env_args.split() if env_args else (args or ["alpaca-mcp-server"])
+            return env_cmd, resolved_args
+
+        if command and command != "uvx":
+            return command, (args if args is not None else ["alpaca-mcp-server"])
+
+        if shutil.which("uvx"):
+            return "uvx", (args if args is not None else ["alpaca-mcp-server"])
+
+        cand_cmd, cand_args = cls._find_alternative_command()
+        if cand_cmd:
+            return cand_cmd, (args if args is not None else cand_args)
+
+        return "uvx", (args if args is not None else ["alpaca-mcp-server"])
 
     def _build_env(self) -> dict[str, str]:
         env = os.environ.copy()
         api_key = env.get("APCA_API_KEY_ID") or env.get("API_KEY") or env.get("ALPACA_API_KEY", "")
         secret_key = env.get("APCA_API_SECRET_KEY") or env.get("SECRET_KEY") or env.get("ALPACA_SECRET_KEY", "")
+        toolsets = env.get("ALPACA_TOOLSETS") or os.getenv("ALPACA_TOOLSETS") or "account,trading,assets,options-data,stock-data"
 
         env.update({
             "ALPACA_API_KEY": api_key,
@@ -308,15 +368,22 @@ class StdioMCPTransport(BaseAlpacaTransport):
             "ALPACA_SECRET_KEY": secret_key,
             "APCA_API_SECRET_KEY": secret_key,
             "ALPACA_PAPER_TRADE": "true",
-            "APCA_API_BASE_URL": "https://paper-api.alpaca.markets",
-            "ALPACA_TOOLSETS": "account,trading,options-data,stock-data",
+            "APCA_API_BASE_URL": env.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets"),
+            "ALPACA_TOOLSETS": toolsets,
         })
         return env
 
     def initialize(self) -> None:
         """Inicializa la sesión MCP stdio y realiza el tool discovery inicial."""
         # Verificar que el comando ejecutable exista en el sistema
-        cmd_path = shutil.which(self.command)
+        cmd_path = shutil.which(self.command) or (self.command if os.path.isfile(self.command) else None)
+        if not cmd_path and (self._user_command is None or self._user_command == "uvx"):
+            cand_cmd, cand_args = self._find_alternative_command()
+            if cand_cmd:
+                self.command = cand_cmd
+                self.args = cand_args
+                cmd_path = shutil.which(self.command) or (self.command if os.path.isfile(self.command) else None)
+
         if not cmd_path:
             raise MCPTransportError(
                 f"Comando ejecutable para MCP '{self.command}' no encontrado en el PATH del sistema."
@@ -330,10 +397,12 @@ class StdioMCPTransport(BaseAlpacaTransport):
         self._tools_cache = [
             MCPTool(name="get_account_info", description="Consulta el balance y estado de la cuenta en Alpaca"),
             MCPTool(name="get_clock", description="Consulta el reloj y horarios de apertura/cierre de mercado"),
+            MCPTool(name="get_calendar", description="Consulta el calendario de días de mercado"),
             MCPTool(name="get_all_positions", description="Lista todas las posiciones abiertas"),
             MCPTool(name="get_option_contracts", description="Consulta contratos de opciones por subyacente"),
             MCPTool(name="get_option_snapshot", description="Consulta cotizaciones en vivo y griegas de opciones"),
             MCPTool(name="place_option_order", description="Envía una nueva orden de opciones"),
+            MCPTool(name="place_stock_order", description="Envía una nueva orden de acciones o ETFs"),
         ]
 
     def is_connected(self) -> bool:
@@ -474,6 +543,32 @@ class StdioMCPTransport(BaseAlpacaTransport):
             self._connected = False
             raise MCPTransportError(f"Fallo al iniciar el servidor MCP '{self.command}': {exc}") from exc
 
+        # Hilo daemon para drenar stderr y evitar saturación del buffer del SO
+        if self._proc and self._proc.stderr:
+            proc_ref = self._proc
+            stderr_stream = self._proc.stderr
+
+            def _drain_stderr() -> None:
+                try:
+                    while proc_ref.poll() is None:
+                        if hasattr(stderr_stream, "closed") and stderr_stream.closed:
+                            break
+                        line = stderr_stream.readline()
+                        if not line or not isinstance(line, str):
+                            break
+                        stripped = line.strip()
+                        if stripped:
+                            logger.debug("mcp.stderr: %s", stripped)
+                except Exception:
+                    pass
+
+            self._stderr_thread = threading.Thread(
+                target=_drain_stderr,
+                daemon=True,
+                name="mcp-stderr-drainer",
+            )
+            self._stderr_thread.start()
+
         # Fuera del try anterior a propósito: errores de handshake (BrokenPipeError,
         # MCPConnectionClosedError, TimeoutError) deben propagar con su tipo original
         # para que el retry loop de _send_jsonrpc_request los reintente correctamente,
@@ -542,6 +637,21 @@ class StdioMCPTransport(BaseAlpacaTransport):
                 except Exception:
                     pass
             self._proc = None
+        self._stderr_thread = None
+
+    @staticmethod
+    def _unwrap_security_envelope(parsed: Any) -> Any:
+        """
+        El servidor oficial alpaca-mcp-server envuelve el resultado real de CADA
+        herramienta en un sobre de seguridad para marcar salidas externas como
+        no confiables:
+            {"_alpaca_mcp_security": {...}, "data": {...datos reales...}}
+        Sin desenvolver esto, cualquier lookup de campo (id, cash, portfolio_value,
+        etc.) en el nivel superior devuelve vacío/0 de forma silenciosa, sin error.
+        """
+        if isinstance(parsed, dict) and "_alpaca_mcp_security" in parsed and "data" in parsed:
+            return parsed["data"]
+        return parsed
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Ejecuta una herramienta en el servidor MCP a través de tools/call."""
@@ -556,18 +666,29 @@ class StdioMCPTransport(BaseAlpacaTransport):
                         error_text = item.get("text", "")
                         continue
                     try:
-                        return json.loads(item.get("text", "{}"))
+                        return self._unwrap_security_envelope(json.loads(item.get("text", "{}")))
                     except Exception:
                         return {"text": item.get("text", "")}
             if res.get("isError"):
                 raise MCPTransportError(f"Herramienta MCP '{name}' devolvió un error: {error_text}")
-        return res
+        return self._unwrap_security_envelope(res)
 
     def get_account(self) -> dict[str, Any]:
         return self.call_tool("get_account_info", {})
 
     def get_clock(self) -> dict[str, Any]:
         return self.call_tool("get_clock", {})
+
+    def get_calendar(self, start: Optional[str] = None, end: Optional[str] = None) -> list[dict[str, Any]]:
+        args: dict[str, Any] = {}
+        if start:
+            args["start"] = str(start)
+        if end:
+            args["end"] = str(end)
+        res = self.call_tool("get_calendar", args)
+        if isinstance(res, list):
+            return res
+        return res.get("calendar", res.get("days", []))
 
     def get_positions(self) -> list[dict[str, Any]]:
         res = self.call_tool("get_all_positions", {})
@@ -602,8 +723,10 @@ class StdioMCPTransport(BaseAlpacaTransport):
         limit_price: Optional[Decimal] = None,
         client_order_id: Optional[str] = None,
     ) -> dict[str, Any]:
-        # place_option_order exige qty como string (no int) y no acepta claves
-        # fuera de su esquema (additionalProperties: False).
+        # Detectar si symbol es una opción OCC o acción/ETF
+        is_option = is_occ_symbol(symbol)
+        tool_name = "place_option_order" if is_option else "place_stock_order"
+
         args: dict[str, Any] = {
             "symbol": symbol,
             "qty": str(qty),
@@ -616,7 +739,7 @@ class StdioMCPTransport(BaseAlpacaTransport):
         if client_order_id:
             args["client_order_id"] = client_order_id
 
-        return self.call_tool("place_option_order", args)
+        return self.call_tool(tool_name, args)
 
     def close(self) -> None:
         self._connected = False
@@ -630,13 +753,25 @@ class StdioMCPTransport(BaseAlpacaTransport):
 class CLITransport(BaseAlpacaTransport):
     """
     Transporte de respaldo y diagnóstico que ejecuta el CLI oficial de Alpaca
-    (/usr/bin/alpaca) parseando salida estructurada en formato JSON (--format json).
+    (/usr/bin/alpaca) parseando salida estructurada en formato JSON.
     """
 
     def __init__(self, binary_path: str = "/usr/bin/alpaca", env: Optional[dict[str, str]] = None):
         self.binary_path = binary_path
-        self.env = env or os.environ.copy()
+        self.env = env or self._build_env()
         self._connected = False
+
+    def _build_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        api_key = env.get("APCA_API_KEY_ID") or env.get("API_KEY") or env.get("ALPACA_API_KEY", "")
+        secret_key = env.get("APCA_API_SECRET_KEY") or env.get("SECRET_KEY") or env.get("ALPACA_SECRET_KEY", "")
+        if api_key:
+            env["ALPACA_API_KEY"] = api_key
+            env["APCA_API_KEY_ID"] = api_key
+        if secret_key:
+            env["ALPACA_SECRET_KEY"] = secret_key
+            env["APCA_API_SECRET_KEY"] = secret_key
+        return env
 
     def initialize(self) -> None:
         """Verifica que el binario del CLI esté instalado y sea ejecutable."""
@@ -648,38 +783,135 @@ class CLITransport(BaseAlpacaTransport):
     def is_connected(self) -> bool:
         return self._connected
 
+    def is_authenticated(self) -> bool:
+        """
+        Verifica si el CLI de Alpaca tiene un perfil configurado y autenticado válidamente.
+        Ejecuta '/usr/bin/alpaca account get' (o fallback a 'alpaca clock').
+        Retorna True si el comando finaliza exitosamente con salida válida, False en caso contrario.
+        """
+        for check_args in [["account", "get"], ["clock"]]:
+            try:
+                res = self._run_cli(check_args)
+                if isinstance(res, dict) and res:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def auto_configure_profile(self, profile_name: Optional[str] = None) -> bool:
+        """
+        Auto-configura de manera no interactiva las credenciales en Alpaca CLI
+        si no está autenticado y las variables de entorno están presentes.
+        Ejecuta '/usr/bin/alpaca profile login --api-key' canalizando '<KEY_ID>\n<SECRET_KEY>\n' a stdin.
+        """
+        if self.is_authenticated():
+            return True
+
+        api_key = (
+            self.env.get("APCA_API_KEY_ID")
+            or self.env.get("ALPACA_API_KEY")
+            or self.env.get("API_KEY")
+            or os.getenv("APCA_API_KEY_ID")
+            or os.getenv("ALPACA_API_KEY")
+            or os.getenv("API_KEY")
+        )
+        secret_key = (
+            self.env.get("APCA_API_SECRET_KEY")
+            or self.env.get("ALPACA_SECRET_KEY")
+            or self.env.get("SECRET_KEY")
+            or os.getenv("APCA_API_SECRET_KEY")
+            or os.getenv("ALPACA_SECRET_KEY")
+            or os.getenv("SECRET_KEY")
+        )
+
+        if not api_key or not secret_key:
+            logger.warning(
+                "auto_configure_profile: No se encontraron variables de credenciales "
+                "(APCA_API_KEY_ID / APCA_API_SECRET_KEY) en el entorno."
+            )
+            return False
+
+        cmd = [self.binary_path, "profile", "login", "--api-key"]
+        if profile_name:
+            cmd.extend(["--name", profile_name])
+
+        input_data = f"{api_key}\n{secret_key}\n"
+        child_env = self.env.copy()
+        child_env["ALPACA_API_KEY"] = api_key
+        child_env["APCA_API_KEY_ID"] = api_key
+        child_env["ALPACA_SECRET_KEY"] = secret_key
+        child_env["APCA_API_SECRET_KEY"] = secret_key
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=input_data,
+                capture_output=True,
+                text=True,
+                env=child_env,
+                timeout=15.0,
+            )
+            if proc.returncode == 0:
+                logger.info("Alpaca CLI autenticado y configurado exitosamente mediante auto_configure_profile.")
+                self.env.update(child_env)
+                return True
+            else:
+                err_msg = (proc.stderr or proc.stdout or "").strip()
+                logger.warning(f"Fallo en auto_configure_profile de Alpaca CLI (código {proc.returncode}): {err_msg}")
+                return False
+        except Exception as exc:
+            logger.warning(f"Error al ejecutar auto_configure_profile de Alpaca CLI: {exc}")
+            return False
+
     def list_tools(self) -> list[MCPTool]:
         """Retorna las herramientas y comandos soportados por el CLI."""
         return [
-            MCPTool(name="alpaca_account_get", description="Ejecuta 'alpaca account get --format json'"),
-            MCPTool(name="alpaca_market_clock", description="Ejecuta 'alpaca market clock --format json'"),
-            MCPTool(name="alpaca_position_list", description="Ejecuta 'alpaca position list --format json'"),
-            MCPTool(name="alpaca_order_submit", description="Ejecuta 'alpaca order submit --format json'"),
+            MCPTool(name="alpaca_account_get", description="Ejecuta 'alpaca account get'"),
+            MCPTool(name="alpaca_market_clock", description="Ejecuta 'alpaca clock'"),
+            MCPTool(name="alpaca_position_list", description="Ejecuta 'alpaca position list'"),
+            MCPTool(name="alpaca_order_submit", description="Ejecuta 'alpaca order submit'"),
         ]
 
     def _run_cli(self, args: list[str]) -> Any:
-        """Ejecuta un subproceso del CLI de Alpaca con --format json y parsea la salida."""
-        cmd = [self.binary_path] + args + ["--format", "json"]
+        """
+        Ejecuta un comando del CLI de Alpaca y parsea la salida JSON resultante.
+        Inyecta credenciales ALPACA_API_KEY y ALPACA_SECRET_KEY en el entorno del proceso.
+        """
+        cmd = [self.binary_path] + args
+
+        # Inyección de credenciales en el entorno del proceso hijo
+        env = self.env.copy()
+        api_key = (
+            env.get("APCA_API_KEY_ID")
+            or env.get("ALPACA_API_KEY")
+            or env.get("API_KEY")
+            or os.getenv("APCA_API_KEY_ID")
+            or os.getenv("ALPACA_API_KEY")
+            or os.getenv("API_KEY")
+        )
+        secret_key = (
+            env.get("APCA_API_SECRET_KEY")
+            or env.get("ALPACA_SECRET_KEY")
+            or env.get("SECRET_KEY")
+            or os.getenv("APCA_API_SECRET_KEY")
+            or os.getenv("ALPACA_SECRET_KEY")
+            or os.getenv("SECRET_KEY")
+        )
+        if api_key:
+            env["ALPACA_API_KEY"] = api_key
+            env["APCA_API_KEY_ID"] = api_key
+        if secret_key:
+            env["ALPACA_SECRET_KEY"] = secret_key
+            env["APCA_API_SECRET_KEY"] = secret_key
+
         try:
             proc = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                env=self.env,
+                env=env,
                 check=False,
             )
-            # Si el binario instalado no reconoce la flag --format (ej. Alpaca CLI oficial que emite JSON por defecto)
-            if proc.returncode != 0 and (
-                "unknown flag: --format" in (proc.stderr or "") or "unknown flag: --format" in (proc.stdout or "")
-            ):
-                cmd = [self.binary_path] + args
-                proc = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    env=self.env,
-                    check=False,
-                )
         except FileNotFoundError as fnf:
             raise CLIExecutionError(f"Binario '{self.binary_path}' no encontrado: {fnf}") from fnf
         except Exception as exc:
@@ -696,6 +928,14 @@ class CLITransport(BaseAlpacaTransport):
         try:
             return json.loads(stdout)
         except json.JSONDecodeError as jde:
+            # Si hay advertencias o banners antes del bloque JSON
+            lines = stdout.splitlines()
+            for i in range(len(lines)):
+                chunk = "\n".join(lines[i:]).strip()
+                try:
+                    return json.loads(chunk)
+                except json.JSONDecodeError:
+                    continue
             raise CLIExecutionError(
                 f"No se pudo parsear la respuesta JSON del CLI: {jde}. Salida recibida: '{stdout}'"
             ) from jde
@@ -709,12 +949,25 @@ class CLITransport(BaseAlpacaTransport):
             return res if isinstance(res, dict) else {}
 
     def get_clock(self) -> dict[str, Any]:
+        # alpaca clock es el comando nativo en alpacahq/cli v0.0.13
         try:
             res = self._run_cli(["market", "clock"])
             return res if isinstance(res, dict) else {}
         except CLIExecutionError:
             res = self._run_cli(["clock"])
             return res if isinstance(res, dict) else {}
+
+    def get_calendar(self, start: Optional[str] = None, end: Optional[str] = None) -> list[dict[str, Any]]:
+        cmd = ["calendar"]
+        if start:
+            cmd.extend(["--start", str(start)])
+        if end:
+            cmd.extend(["--end", str(end)])
+        try:
+            res = self._run_cli(cmd)
+            return res if isinstance(res, list) else []
+        except Exception:
+            return []
 
     def get_positions(self) -> list[dict[str, Any]]:
         try:
@@ -731,8 +984,6 @@ class CLITransport(BaseAlpacaTransport):
         max_dte: int = 30,
         **filters: Any,
     ) -> list[dict[str, Any]]:
-        # El CLI de Alpaca es primariamente de trading de acciones/órdenes;
-        # retorna lista vacía para delegar a generador o cadena estructurada
         return []
 
     def submit_order(
@@ -759,7 +1010,13 @@ class CLITransport(BaseAlpacaTransport):
             cmd.extend(["--client-order-id", str(client_order_id)])
 
         res = self._run_cli(cmd)
-        return res if isinstance(res, dict) else {"status": "submitted", "raw": res}
+        if isinstance(res, dict):
+            oid = str(res.get("order_id") or res.get("id") or "")
+            if oid:
+                res.setdefault("order_id", oid)
+                res.setdefault("id", oid)
+            return res
+        return {"status": "submitted", "order_id": "", "id": "", "raw": res}
 
     def close(self) -> None:
         self._connected = False
@@ -913,6 +1170,20 @@ class MockMCPTransport(BaseAlpacaTransport):
             "next_close": f"{today_str}T16:00:00-04:00",
         }
 
+    def get_calendar(self, start: Optional[str] = None, end: Optional[str] = None) -> list[dict[str, Any]]:
+        self._check_simulation_guards("get_calendar")
+        today = self.anchor_date or datetime.now(timezone.utc).date()
+        today_str = today.strftime("%Y-%m-%d")
+        return [
+            {
+                "date": today_str,
+                "open": "09:30",
+                "close": "16:00",
+                "session_open": "09:30",
+                "session_close": "16:00",
+            }
+        ]
+
     def get_positions(self) -> list[dict[str, Any]]:
         self._check_simulation_guards("get_all_positions")
         return []
@@ -1030,6 +1301,7 @@ class MockMCPTransport(BaseAlpacaTransport):
 
         order_record = {
             "id": order_id,
+            "order_id": order_id,
             "client_order_id": client_order_id or f"client-{order_id}",
             "symbol": symbol,
             "qty": str(qty),
@@ -1122,17 +1394,19 @@ class AlpacaGateway:
                 except Exception as mcp_err:
                     logger.info(f"StdioMCPTransport no disponible ({mcp_err}). Evaluando fallback...")
 
-            # 2. Intentar CLI Transport si hay credenciales
+            # 2. Intentar CLI Transport si hay credenciales y fallback_to_cli
             if self.fallback_to_cli and has_credentials:
                 try:
                     cli = CLITransport(binary_path=self.cli_path)
                     cli.initialize()
+                    if not cli.is_authenticated():
+                        cli.auto_configure_profile()
                     logger.info("Activado fallback a CLITransport (/usr/bin/alpaca).")
                     return cli
                 except Exception as cli_err:
                     logger.info(f"CLITransport no disponible ({cli_err}). Evaluando Mock fallback...")
 
-            # 3. En entorno dev/test sin credenciales o con fallos, activar MockMCPTransport con aviso
+            # 3. En entorno dev/test sin credenciales o con fallos de transporte real, activar MockMCPTransport
             logger.info("Activando MockMCPTransport para pruebas deterministas offline.")
             mock = MockMCPTransport()
             mock.initialize()
@@ -1156,8 +1430,19 @@ class AlpacaGateway:
             if self.mode == "auto" and not isinstance(self.transport, MockMCPTransport):
                 logger.warning(
                     f"Transporte {type(self.transport).__name__} falló en modo auto ({exc}). "
-                    f"Activando fallback a MockMCPTransport."
+                    f"Evaluando fallback..."
                 )
+                if isinstance(self.transport, StdioMCPTransport) and self.fallback_to_cli:
+                    try:
+                        cli = CLITransport(binary_path=self.cli_path)
+                        cli.initialize()
+                        if not cli.is_authenticated():
+                            cli.auto_configure_profile()
+                        self.transport = cli
+                        raw = self.transport.get_account()
+                        return AccountSnapshot.from_alpaca_account(raw)
+                    except Exception as cli_exc:
+                        logger.warning(f"Fallback a CLITransport falló ({cli_exc}). Activando MockMCPTransport.")
                 self.transport = MockMCPTransport()
                 self.transport.initialize()
                 raw = self.transport.get_account()
@@ -1179,11 +1464,25 @@ class AlpacaGateway:
             if self.mode == "auto" and not isinstance(self.transport, MockMCPTransport):
                 logger.warning(
                     f"Transporte {type(self.transport).__name__} falló en modo auto ({exc}). "
-                    f"Activando fallback a MockMCPTransport."
+                    f"Evaluando fallback..."
                 )
-                self.transport = MockMCPTransport()
-                self.transport.initialize()
-                raw = self.transport.get_clock()
+                if isinstance(self.transport, StdioMCPTransport) and self.fallback_to_cli:
+                    try:
+                        cli = CLITransport(binary_path=self.cli_path)
+                        cli.initialize()
+                        if not cli.is_authenticated():
+                            cli.auto_configure_profile()
+                        self.transport = cli
+                        raw = self.transport.get_clock()
+                    except Exception as cli_exc:
+                        logger.warning(f"Fallback a CLITransport falló ({cli_exc}). Activando MockMCPTransport.")
+                        self.transport = MockMCPTransport()
+                        self.transport.initialize()
+                        raw = self.transport.get_clock()
+                else:
+                    self.transport = MockMCPTransport()
+                    self.transport.initialize()
+                    raw = self.transport.get_clock()
             else:
                 raise
         return MarketClockInfo(
@@ -1196,6 +1495,38 @@ class AlpacaGateway:
     def get_market_clock(self) -> MarketClock:
         """Alias compatible para get_clock()."""
         return self.get_clock()
+
+    def get_calendar(self, start: Optional[str] = None, end: Optional[str] = None) -> list[dict[str, Any]]:
+        """
+        Consulta el calendario de mercado para el rango de fechas especificado.
+        Interface Contract: get_calendar(start, end) -> list[dict]
+        """
+        try:
+            if hasattr(self.transport, "get_calendar"):
+                return self.transport.get_calendar(start=start, end=end)
+            return []
+        except Exception as exc:
+            if self.mode == "auto" and not isinstance(self.transport, MockMCPTransport):
+                logger.warning(
+                    f"Transporte {type(self.transport).__name__} falló en get_calendar ({exc}). "
+                    f"Evaluando fallback..."
+                )
+                if isinstance(self.transport, StdioMCPTransport) and self.fallback_to_cli:
+                    try:
+                        cli = CLITransport(binary_path=self.cli_path)
+                        cli.initialize()
+                        if not cli.is_authenticated():
+                            cli.auto_configure_profile()
+                        self.transport = cli
+                        if hasattr(self.transport, "get_calendar"):
+                            return self.transport.get_calendar(start=start, end=end)
+                    except Exception as cli_exc:
+                        logger.warning(f"Fallback a CLITransport falló ({cli_exc}). Activando MockMCPTransport.")
+                self.transport = MockMCPTransport()
+                self.transport.initialize()
+                if hasattr(self.transport, "get_calendar"):
+                    return self.transport.get_calendar(start=start, end=end)
+            return []
 
     def get_option_chain(
         self,
@@ -1309,30 +1640,201 @@ class AlpacaGateway:
 
         return contracts
 
+    def submit_stock_order(
+        self,
+        symbol: str,
+        qty: int,
+        side: str,
+        order_type: str = "market",
+        time_in_force: str = "day",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """
+        Envía una orden de acciones o ETFs a través del transporte activo.
+        Dispatches 'place_stock_order' en MCP o 'alpaca order submit' en CLI.
+        Interface Contract: submit_stock_order(symbol, qty, side, order_type, time_in_force) -> dict
+        """
+        if qty <= 0:
+            raise StockOrderError(f"La cantidad de acciones debe ser mayor a 0 (recibido: {qty})")
+
+        if order_type.lower() in {"day", "gtc", "ioc", "fok", "opg", "cls"}:
+            actual_tif = order_type
+            actual_type = kwargs.get("order_type", "market")
+        else:
+            actual_type = order_type
+            actual_tif = time_in_force
+
+        try:
+            res = self.transport.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side=side,
+                time_in_force=actual_tif,
+                order_type=actual_type,
+                limit_price=kwargs.get("limit_price"),
+                client_order_id=kwargs.get("client_order_id"),
+            )
+        except Exception as exc:
+            if self.mode == "auto" and not isinstance(self.transport, MockMCPTransport):
+                logger.warning(
+                    f"Transporte {type(self.transport).__name__} falló en submit_stock_order ({exc}). "
+                    f"Evaluando fallback..."
+                )
+                if isinstance(self.transport, StdioMCPTransport) and self.fallback_to_cli:
+                    try:
+                        cli = CLITransport(binary_path=self.cli_path)
+                        cli.initialize()
+                        if not cli.is_authenticated():
+                            cli.auto_configure_profile()
+                        self.transport = cli
+                        return self.submit_stock_order(
+                            symbol=symbol,
+                            qty=qty,
+                            side=side,
+                            order_type=actual_type,
+                            time_in_force=actual_tif,
+                            **kwargs,
+                        )
+                    except Exception as cli_exc:
+                        logger.warning(f"Fallback a CLITransport falló ({cli_exc}). Activando MockMCPTransport.")
+                self.transport = MockMCPTransport()
+                self.transport.initialize()
+                res = self.transport.submit_order(
+                    symbol=symbol,
+                    qty=qty,
+                    side=side,
+                    time_in_force=actual_tif,
+                    order_type=actual_type,
+                    limit_price=kwargs.get("limit_price"),
+                    client_order_id=kwargs.get("client_order_id"),
+                )
+            else:
+                raise
+
+        if isinstance(res, dict):
+            oid = str(res.get("order_id") or res.get("id") or "")
+            res["order_id"] = oid
+            res["id"] = oid
+            res.setdefault("symbol", symbol)
+            res.setdefault("qty", str(qty))
+            res.setdefault("side", side.lower())
+            res.setdefault("status", "submitted")
+        return res
+
     def submit_option_order(
         self,
         symbol: str,
         qty: int,
         side: str,
+        order_type: str = "market",
         time_in_force: str = "day",
         **kwargs: Any,
     ) -> dict[str, Any]:
         """
         Envía una orden de contrato de opción a través del transporte activo.
-        Interface Contract: submit_option_order(symbol, qty, side, time_in_force) -> dict
+        Dispatches 'place_option_order' en MCP o 'alpaca order submit' en CLI.
+        Interface Contract: submit_option_order(symbol, qty, side, order_type, time_in_force) -> dict
         """
         if qty <= 0:
             raise OptionOrderError(f"La cantidad de contratos debe ser mayor a 0 (recibido: {qty})")
 
-        return self.transport.submit_order(
-            symbol=symbol,
-            qty=qty,
-            side=side,
-            time_in_force=time_in_force,
-            order_type=kwargs.get("order_type", "market"),
-            limit_price=kwargs.get("limit_price"),
-            client_order_id=kwargs.get("client_order_id"),
-        )
+        if order_type.lower() in {"day", "gtc", "ioc", "fok", "opg", "cls"}:
+            actual_tif = order_type
+            actual_type = kwargs.get("order_type", "market")
+        else:
+            actual_type = order_type
+            actual_tif = time_in_force
+
+        try:
+            res = self.transport.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side=side,
+                time_in_force=actual_tif,
+                order_type=actual_type,
+                limit_price=kwargs.get("limit_price"),
+                client_order_id=kwargs.get("client_order_id"),
+            )
+        except Exception as exc:
+            if self.mode == "auto" and not isinstance(self.transport, MockMCPTransport):
+                logger.warning(
+                    f"Transporte {type(self.transport).__name__} falló en submit_option_order ({exc}). "
+                    f"Evaluando fallback..."
+                )
+                if isinstance(self.transport, StdioMCPTransport) and self.fallback_to_cli:
+                    try:
+                        cli = CLITransport(binary_path=self.cli_path)
+                        cli.initialize()
+                        if not cli.is_authenticated():
+                            cli.auto_configure_profile()
+                        self.transport = cli
+                        return self.submit_option_order(
+                            symbol=symbol,
+                            qty=qty,
+                            side=side,
+                            order_type=actual_type,
+                            time_in_force=actual_tif,
+                            **kwargs,
+                        )
+                    except Exception as cli_exc:
+                        logger.warning(f"Fallback a CLITransport falló ({cli_exc}). Activando MockMCPTransport.")
+                self.transport = MockMCPTransport()
+                self.transport.initialize()
+                res = self.transport.submit_order(
+                    symbol=symbol,
+                    qty=qty,
+                    side=side,
+                    time_in_force=actual_tif,
+                    order_type=actual_type,
+                    limit_price=kwargs.get("limit_price"),
+                    client_order_id=kwargs.get("client_order_id"),
+                )
+            else:
+                raise
+
+        if isinstance(res, dict):
+            oid = str(res.get("order_id") or res.get("id") or "")
+            res["order_id"] = oid
+            res["id"] = oid
+            res.setdefault("symbol", symbol)
+            res.setdefault("qty", str(qty))
+            res.setdefault("side", side.lower())
+            res.setdefault("status", "submitted")
+        return res
+
+    def submit_order(
+        self,
+        symbol: str,
+        qty: int,
+        side: str,
+        order_type: str = "market",
+        time_in_force: str = "day",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """
+        Envía una orden al broker, detectando automáticamente si symbol corresponde
+        a un contrato de opción OCC (despacha submit_option_order) o acción/ETF
+        (despacha submit_stock_order).
+        Interface Contract: submit_order(symbol, qty, side, order_type, time_in_force) -> dict
+        """
+        if is_occ_symbol(symbol):
+            return self.submit_option_order(
+                symbol=symbol,
+                qty=qty,
+                side=side,
+                order_type=order_type,
+                time_in_force=time_in_force,
+                **kwargs,
+            )
+        else:
+            return self.submit_stock_order(
+                symbol=symbol,
+                qty=qty,
+                side=side,
+                order_type=order_type,
+                time_in_force=time_in_force,
+                **kwargs,
+            )
 
     def close(self) -> None:
         """Cierra el transporte activo y libera recursos."""

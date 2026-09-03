@@ -115,7 +115,41 @@ class RiskEngine:
         max_contracts = int(budget // contract_unit_cost)
         return max(0, max_contracts)
 
-    def evaluate_trade(
+    def calculate_max_safe_quantity(
+        self,
+        price: Decimal,
+        budget: Decimal,
+        asset_class: str = "option",
+        current_options_exposure: Decimal = Decimal("0.0"),
+        portfolio_value: Decimal = Decimal("0.0"),
+    ) -> int:
+        """
+        Calcula la cantidad máxima de unidades (acciones o contratos) que se pueden
+        adquirir sin exceder el presupuesto seguro ni el tope acumulado.
+        - Para acciones/ETFs (multiplier = 1): floor(B_effective / P_ask)
+        - Para opciones (multiplier = 100): floor(B_effective / (P_ask * 100))
+        """
+        is_equity = (asset_class or "option").lower() in ("equity", "stock")
+        if price <= Decimal("0.0") or budget <= Decimal("0.0"):
+            return 0
+
+        effective_budget = budget
+        if not is_equity and portfolio_value > Decimal("0.0"):
+            total_options_cap = (portfolio_value * self.config.max_portfolio_options_pct).quantize(Decimal("0.01"))
+            remaining_cap = max(Decimal("0.0"), total_options_cap - current_options_exposure)
+            effective_budget = min(effective_budget, remaining_cap)
+
+        if effective_budget <= Decimal("0.0"):
+            return 0
+
+        unit_cost = price if is_equity else (price * Decimal("100"))
+        if unit_cost <= Decimal("0.0"):
+            return 0
+
+        max_qty = int(effective_budget // unit_cost)
+        return max(0, max_qty)
+
+    def evaluate_proposal(
         self,
         proposal: TradeProposal,
         snapshot: Optional[AccountSnapshot] = None,
@@ -127,21 +161,27 @@ class RiskEngine:
         **kwargs: Any,
     ) -> RiskVerdict:
         """
-        Evalúa integralmente la propuesta de trade frente a todas las reglas deterministas de riesgo.
+        Evalúa integralmente la propuesta de trade multi-activo (acciones/ETFs y contratos de opciones)
+        frente a todas las reglas deterministas de riesgo.
 
-        Reglas de Validación:
+        Reglas Generales (Ambos Activos):
         1. Salud de la cuenta (activa, no congelada, sin margin call, equity positivo).
-        2. Cotización y Spread: ask > bid > 0, spread pct <= 5%, absolute spread <= $0.50.
-        3. Liquidez: volumen de contratos >= 100, open interest >= 500.
-        4. Horizonte y DTE: 1 <= DTE <= 30 (bloqueo estricto de 0-DTE pin risk y contratos vencidos).
-        5. Griegas:
-           - Call Delta in [0.30, 0.70]
-           - Put Delta in [-0.70, -0.30]
-           - Theta decay diario (|theta| / ask) <= 5.00% y |theta| <= $0.15/día
-           - IV in [0.05, 1.00]
-        6. Regla del 5%: trade_cost <= 5% portfolio_value.
-        7. Presupuesto efectivo: trade_cost <= min(5% cap, buying_power, cash).
-        8. Asignación acumulada en opciones: total_options_exposure <= 25% portfolio_value.
+        2. Regla del 5% de riesgo máximo de cartera por operación:
+           - Para acciones/ETFs: P_ask * Q <= 0.05 * V_portfolio (multiplicador = 1).
+           - Para opciones: P_ask * 100 * Q <= 0.05 * V_portfolio (multiplicador = 100).
+        3. Presupuesto efectivo: trade_cost <= min(budget, cash, buying_power).
+        4. Cotización válida, positiva y no cruzada (Ask >= Bid > 0).
+        5. Límites de Bid-Ask spread: relativo <= 5.00% y absoluto <= $0.50.
+        6. Sizing seguro recomendado (quantity capping):
+           - Acciones: floor(budget / ask_price)
+           - Opciones: floor(budget / (ask_price * 100))
+
+        Reglas Exclusivas de Opciones:
+        - Liquidez del contrato: Open Interest >= 500, Volumen >= 100.
+        - Horizonte y DTE: 1 <= DTE <= 30 (bloqueo estricto de 0-DTE pin risk).
+        - Griegas y Volatilidad: Delta en rango ([0.30, 0.70] CALL / [-0.70, -0.30] PUT),
+          Theta decay <= 5% diario y <= $0.15/día, IV in [0.05, 1.00].
+        - Asignación acumulada en opciones <= 25% del portfolio.
         """
         # Resolver snapshot y cuenta
         snap = account if account is not None else snapshot
@@ -168,8 +208,12 @@ class RiskEngine:
         if opt_contract is None and proposal is not None and hasattr(proposal, "contract"):
             opt_contract = proposal.contract
 
+        # Determinar clase de activo
+        asset_class = (getattr(proposal, "asset_class", "option") or "option").lower() if proposal is not None else "option"
+        is_equity = asset_class in ("equity", "stock")
+
         # Validación estructural de entradas nulas
-        if proposal is None or opt_contract is None or snap is None:
+        if proposal is None or snap is None or (not is_equity and opt_contract is None):
             return RiskVerdict(
                 is_approved=False,
                 reason_code=RiskReasonCode.ERR_INVALID_ORDER_QUANTITY,
@@ -234,62 +278,142 @@ class RiskEngine:
 
         warnings.extend(health.warnings)
 
-        # 2. Validación de Cotizaciones y Spread de Opciones
-        is_quote_invalid = (
-            opt_contract.bid_price <= Decimal("0.0")
-            or opt_contract.ask_price <= Decimal("0.0")
-            or opt_contract.ask_price <= opt_contract.bid_price
-        )
-        if is_quote_invalid:
-            reasons.append(
-                f"Cotizaciones Bid (${opt_contract.bid_price}) o Ask (${opt_contract.ask_price}) "
-                f"inválidas o cruzadas (Ask <= Bid o cotizaciones <= 0)."
-            )
-            reason_codes.extend([
-                RiskReasonCode.ERR_CROSSED_OR_ZERO_QUOTE,
-                RiskReasonCode.ERR_SPREAD_INVALID_OR_CROSSED,
-            ])
+        # 2. Validación de Cotizaciones y Spread por Clase de Activo
+        eq_ask_dec = Decimal("0.0")
+        eq_bid_dec = Decimal("0.0")
+        rel_spread = Decimal("0.0")
+        symbol = ""
 
-        # Spread porcentual en opciones (<= 5.00%)
-        if opt_contract.bid_ask_spread_pct > self.config.max_option_spread_pct:
-            reasons.append(
-                f"Spread Bid/Ask excesivo ({opt_contract.bid_ask_spread_pct * Decimal('100.0')}% > "
-                f"{self.config.max_option_spread_pct * Decimal('100.0')}%)."
-            )
-            reason_codes.extend([
-                RiskReasonCode.ERR_WIDE_BID_ASK_SPREAD,
-                RiskReasonCode.ERR_SPREAD_EXCEEDS_MAX,
-            ])
+        if is_equity:
+            # Validación de símbolo para acciones/ETFs
+            symbol = getattr(proposal, "symbol", "") or (opt_contract.symbol if opt_contract else "")
+            if not symbol or not isinstance(symbol, str) or not symbol.strip():
+                reasons.append("Símbolo de acción o ETF inválido o ausente.")
+                reason_codes.append(RiskReasonCode.ERR_INVALID_ORDER_QUANTITY)
 
-        # Spread absoluto en opciones (<= $0.50)
-        abs_spread = opt_contract.ask_price - opt_contract.bid_price
-        if abs_spread > self.config.max_absolute_spread:
-            reasons.append(
-                f"Spread Bid/Ask absoluto excesivo (${abs_spread} > ${self.config.max_absolute_spread})."
-            )
-            reason_codes.extend([
-                RiskReasonCode.ERR_WIDE_BID_ASK_SPREAD,
-                RiskReasonCode.ERR_SPREAD_EXCEEDS_MAX,
-            ])
+            # Extraer ask_price y bid_price de acciones
+            eq_ask = None
+            eq_bid = None
 
-        # Spread del activo subyacente (<= 1.00%)
-        if "underlying_spread_pct" in kwargs:
-            u_spread = to_decimal(kwargs["underlying_spread_pct"])
-            if u_spread > self.config.max_underlying_spread_pct:
+            if "ask_price" in kwargs:
+                eq_ask = kwargs["ask_price"]
+            elif "underlying_ask" in kwargs:
+                eq_ask = kwargs["underlying_ask"]
+            elif getattr(proposal, "ask_price", None) is not None:
+                eq_ask = proposal.ask_price
+            elif opt_contract is not None:
+                eq_ask = opt_contract.ask_price
+
+            if "bid_price" in kwargs:
+                eq_bid = kwargs["bid_price"]
+            elif "underlying_bid" in kwargs:
+                eq_bid = kwargs["underlying_bid"]
+            elif getattr(proposal, "bid_price", None) is not None:
+                eq_bid = proposal.bid_price
+            elif opt_contract is not None:
+                eq_bid = opt_contract.bid_price
+
+            gen_price = (
+                getattr(proposal, "price", None)
+                or kwargs.get("price")
+                or kwargs.get("underlying_price")
+                or u_price
+                or proposal.limit_price
+            )
+            if eq_ask is None:
+                eq_ask = gen_price
+            if eq_bid is None:
+                eq_bid = gen_price if gen_price is not None else eq_ask
+
+            eq_ask_dec = to_decimal(eq_ask) if eq_ask is not None else Decimal("0.0")
+            eq_bid_dec = to_decimal(eq_bid) if eq_bid is not None else Decimal("0.0")
+
+            # Cotizaciones positivas
+            if eq_ask_dec <= Decimal("0.0") or eq_bid_dec <= Decimal("0.0"):
                 reasons.append(
-                    f"Spread del subyacente excesivo ({u_spread * Decimal('100.0')}% > "
-                    f"{self.config.max_underlying_spread_pct * Decimal('100.0')}%)."
+                    f"Cotizaciones Bid (${eq_bid_dec}) o Ask (${eq_ask_dec}) de acciones inválidas o no positivas."
+                )
+                reason_codes.extend([
+                    RiskReasonCode.ERR_CROSSED_OR_ZERO_QUOTE,
+                    RiskReasonCode.ERR_SPREAD_INVALID_OR_CROSSED,
+                ])
+            # Cotizaciones cruzadas (Ask < Bid)
+            elif eq_ask_dec < eq_bid_dec:
+                reasons.append(
+                    f"Cotizaciones de acciones cruzadas: Ask (${eq_ask_dec}) < Bid (${eq_bid_dec})."
+                )
+                reason_codes.extend([
+                    RiskReasonCode.ERR_CROSSED_OR_ZERO_QUOTE,
+                    RiskReasonCode.ERR_SPREAD_INVALID_OR_CROSSED,
+                ])
+            else:
+                abs_spread = eq_ask_dec - eq_bid_dec
+                mid_price = (eq_ask_dec + eq_bid_dec) / Decimal("2.0")
+                rel_spread = (abs_spread / mid_price) if mid_price > Decimal("0.0") else Decimal("0.0")
+
+                # Spread relativo (<= 5.00%)
+                if rel_spread > self.config.max_option_spread_pct:
+                    reasons.append(
+                        f"Spread Bid/Ask relativo excesivo ({rel_spread * Decimal('100.0')}% > "
+                        f"{self.config.max_option_spread_pct * Decimal('100.0')}%)."
+                    )
+                    reason_codes.extend([
+                        RiskReasonCode.ERR_WIDE_BID_ASK_SPREAD,
+                        RiskReasonCode.ERR_SPREAD_EXCEEDS_MAX,
+                    ])
+
+                # Spread absoluto (<= $0.50)
+                if abs_spread > self.config.max_absolute_spread:
+                    reasons.append(
+                        f"Spread Bid/Ask absoluto excesivo (${abs_spread} > ${self.config.max_absolute_spread})."
+                    )
+                    reason_codes.extend([
+                        RiskReasonCode.ERR_WIDE_BID_ASK_SPREAD,
+                        RiskReasonCode.ERR_SPREAD_EXCEEDS_MAX,
+                    ])
+
+        else:
+            # 2. Validación de Cotizaciones y Spread de Opciones
+            is_quote_invalid = (
+                opt_contract.bid_price <= Decimal("0.0")
+                or opt_contract.ask_price <= Decimal("0.0")
+                or opt_contract.ask_price <= opt_contract.bid_price
+            )
+            if is_quote_invalid:
+                reasons.append(
+                    f"Cotizaciones Bid (${opt_contract.bid_price}) o Ask (${opt_contract.ask_price}) "
+                    f"inválidas o cruzadas (Ask <= Bid o cotizaciones <= 0)."
+                )
+                reason_codes.extend([
+                    RiskReasonCode.ERR_CROSSED_OR_ZERO_QUOTE,
+                    RiskReasonCode.ERR_SPREAD_INVALID_OR_CROSSED,
+                ])
+
+            # Spread porcentual en opciones (<= 5.00%)
+            if opt_contract.bid_ask_spread_pct > self.config.max_option_spread_pct:
+                reasons.append(
+                    f"Spread Bid/Ask excesivo ({opt_contract.bid_ask_spread_pct * Decimal('100.0')}% > "
+                    f"{self.config.max_option_spread_pct * Decimal('100.0')}%)."
                 )
                 reason_codes.extend([
                     RiskReasonCode.ERR_WIDE_BID_ASK_SPREAD,
-                    RiskReasonCode.ERR_UNDERLYING_SPREAD_EXCEEDS_MAX,
+                    RiskReasonCode.ERR_SPREAD_EXCEEDS_MAX,
                 ])
-        elif "underlying_bid" in kwargs and "underlying_ask" in kwargs:
-            u_bid = to_decimal(kwargs["underlying_bid"])
-            u_ask = to_decimal(kwargs["underlying_ask"])
-            u_mid = (u_bid + u_ask) / Decimal("2.0")
-            if u_mid > Decimal("0.0"):
-                u_spread = (u_ask - u_bid) / u_mid
+
+            # Spread absoluto en opciones (<= $0.50)
+            abs_spread = opt_contract.ask_price - opt_contract.bid_price
+            if abs_spread > self.config.max_absolute_spread:
+                reasons.append(
+                    f"Spread Bid/Ask absoluto excesivo (${abs_spread} > ${self.config.max_absolute_spread})."
+                )
+                reason_codes.extend([
+                    RiskReasonCode.ERR_WIDE_BID_ASK_SPREAD,
+                    RiskReasonCode.ERR_SPREAD_EXCEEDS_MAX,
+                ])
+
+            # Spread del activo subyacente (<= 1.00%)
+            if "underlying_spread_pct" in kwargs:
+                u_spread = to_decimal(kwargs["underlying_spread_pct"])
                 if u_spread > self.config.max_underlying_spread_pct:
                     reasons.append(
                         f"Spread del subyacente excesivo ({u_spread * Decimal('100.0')}% > "
@@ -299,94 +423,109 @@ class RiskEngine:
                         RiskReasonCode.ERR_WIDE_BID_ASK_SPREAD,
                         RiskReasonCode.ERR_UNDERLYING_SPREAD_EXCEEDS_MAX,
                     ])
+            elif "underlying_bid" in kwargs and "underlying_ask" in kwargs:
+                u_bid = to_decimal(kwargs["underlying_bid"])
+                u_ask = to_decimal(kwargs["underlying_ask"])
+                u_mid = (u_bid + u_ask) / Decimal("2.0")
+                if u_mid > Decimal("0.0"):
+                    u_spread = (u_ask - u_bid) / u_mid
+                    if u_spread > self.config.max_underlying_spread_pct:
+                        reasons.append(
+                            f"Spread del subyacente excesivo ({u_spread * Decimal('100.0')}% > "
+                            f"{self.config.max_underlying_spread_pct * Decimal('100.0')}%)."
+                        )
+                        reason_codes.extend([
+                            RiskReasonCode.ERR_WIDE_BID_ASK_SPREAD,
+                            RiskReasonCode.ERR_UNDERLYING_SPREAD_EXCEEDS_MAX,
+                        ])
 
-        # 3. Validación de Liquidez del Contrato
-        if opt_contract.open_interest < self.config.min_open_interest:
-            reasons.append(
-                f"Open Interest insuficiente ({opt_contract.open_interest} < {self.config.min_open_interest} contratos)."
-            )
-            reason_codes.extend([
-                RiskReasonCode.ERR_INSUFFICIENT_OPEN_INTEREST,
-                RiskReasonCode.ERR_OPEN_INTEREST_BELOW_MIN,
-            ])
-
-        if opt_contract.volume < self.config.min_volume:
-            reasons.append(
-                f"Volumen diario de contratos insuficiente ({opt_contract.volume} < {self.config.min_volume} contratos)."
-            )
-            reason_codes.extend([
-                RiskReasonCode.ERR_INSUFFICIENT_VOLUME,
-                RiskReasonCode.ERR_VOLUME_BELOW_MIN,
-            ])
-
-        # 4. Validación de Horizonte y DTE (1 a 30 días)
-        if opt_contract.dte < self.config.min_dte:
-            reasons.append(
-                f"Horizonte DTE inválido ({opt_contract.dte} días < {self.config.min_dte} días). "
-                f"Bloqueo estricto de pin risk y expiración inmediata (0-DTE)."
-            )
-            reason_codes.extend([
-                RiskReasonCode.ERR_DTE_OUT_OF_BOUNDS,
-                RiskReasonCode.ERR_DTE_BELOW_MIN,
-            ])
-        elif opt_contract.dte > self.config.max_dte:
-            reasons.append(
-                f"Horizonte DTE inválido ({opt_contract.dte} días > {self.config.max_dte} días). "
-                f"Supera el horizonte máximo de swing trading ({self.config.max_dte} días)."
-            )
-            reason_codes.extend([
-                RiskReasonCode.ERR_DTE_OUT_OF_BOUNDS,
-                RiskReasonCode.ERR_DTE_ABOVE_MAX,
-            ])
-
-        # 5. Validación de Griegas y Volatilidad
-        c_type_str = opt_contract.contract_type.value if hasattr(opt_contract.contract_type, "value") else str(opt_contract.contract_type)
-        c_type_upper = c_type_str.upper()
-        delta = opt_contract.greeks.delta
-
-        if "CALL" in c_type_upper:
-            if delta < self.config.call_delta_min or delta > self.config.call_delta_max:
+            # 3. Validación de Liquidez del Contrato de Opciones
+            if opt_contract.open_interest < self.config.min_open_interest:
                 reasons.append(
-                    f"Delta de CALL fuera de rango permitido ({delta} no está en "
-                    f"[{self.config.call_delta_min}, {self.config.call_delta_max}])."
+                    f"Open Interest insuficiente ({opt_contract.open_interest} < {self.config.min_open_interest} contratos)."
                 )
-                reason_codes.append(RiskReasonCode.ERR_DELTA_OUT_OF_BOUNDS)
-        elif "PUT" in c_type_upper:
-            if delta < self.config.put_delta_min or delta > self.config.put_delta_max:
-                reasons.append(
-                    f"Delta de PUT fuera de rango permitido ({delta} no está en "
-                    f"[{self.config.put_delta_min}, {self.config.put_delta_max}])."
-                )
-                reason_codes.append(RiskReasonCode.ERR_DELTA_OUT_OF_BOUNDS)
-        else:
-            if abs(delta) < self.config.call_delta_min or abs(delta) > self.config.call_delta_max:
-                reasons.append(f"Delta fuera de rango permitido ({delta}).")
-                reason_codes.append(RiskReasonCode.ERR_DELTA_OUT_OF_BOUNDS)
+                reason_codes.extend([
+                    RiskReasonCode.ERR_INSUFFICIENT_OPEN_INTEREST,
+                    RiskReasonCode.ERR_OPEN_INTEREST_BELOW_MIN,
+                ])
 
-        # Validación de Decaimiento Theta
-        theta = opt_contract.greeks.theta
-        if opt_contract.ask_price > Decimal("0.0"):
-            theta_decay_rate = (abs(theta) / opt_contract.ask_price).quantize(
-                Decimal("0.0001"), rounding=ROUND_HALF_UP
-            )
-            if theta_decay_rate > self.config.max_theta_decay_pct or abs(theta) > self.config.max_theta_absolute:
+            if opt_contract.volume < self.config.min_volume:
                 reasons.append(
-                    f"Tasa de decaimiento Theta diaria excesiva ({theta_decay_rate * Decimal('100.0')}% > "
-                    f"{self.config.max_theta_decay_pct * Decimal('100.0')}% diario o |theta| > ${self.config.max_theta_absolute})."
+                    f"Volumen diario de contratos insuficiente ({opt_contract.volume} < {self.config.min_volume} contratos)."
                 )
-                reason_codes.append(RiskReasonCode.ERR_THETA_DECAY_EXCESSIVE)
+                reason_codes.extend([
+                    RiskReasonCode.ERR_INSUFFICIENT_VOLUME,
+                    RiskReasonCode.ERR_VOLUME_BELOW_MIN,
+                ])
 
-        # Validación de Volatilidad Implícita (IV)
-        iv = opt_contract.greeks.implied_volatility
-        if iv < self.config.min_iv or iv > self.config.max_iv:
-            reasons.append(
-                f"Volatilidad Implícita (IV) fuera de rango ({iv} no está en "
-                f"[{self.config.min_iv}, {self.config.max_iv}])."
-            )
-            reason_codes.extend([
-                RiskReasonCode.ERR_IV_OUT_OF_BOUNDS,
-                RiskReasonCode.ERR_IV_OUT_OF_RANGE,
-            ])
+            # 4. Validación de Horizonte y DTE (1 a 30 días)
+            if opt_contract.dte < self.config.min_dte:
+                reasons.append(
+                    f"Horizonte DTE inválido ({opt_contract.dte} días < {self.config.min_dte} días). "
+                    f"Bloqueo estricto de pin risk y expiración inmediata (0-DTE)."
+                )
+                reason_codes.extend([
+                    RiskReasonCode.ERR_DTE_OUT_OF_BOUNDS,
+                    RiskReasonCode.ERR_DTE_BELOW_MIN,
+                ])
+            elif opt_contract.dte > self.config.max_dte:
+                reasons.append(
+                    f"Horizonte DTE inválido ({opt_contract.dte} días > {self.config.max_dte} días). "
+                    f"Supera el horizonte máximo de swing trading ({self.config.max_dte} días)."
+                )
+                reason_codes.extend([
+                    RiskReasonCode.ERR_DTE_OUT_OF_BOUNDS,
+                    RiskReasonCode.ERR_DTE_ABOVE_MAX,
+                ])
+
+            # 5. Validación de Griegas y Volatilidad
+            c_type_str = opt_contract.contract_type.value if hasattr(opt_contract.contract_type, "value") else str(opt_contract.contract_type)
+            c_type_upper = c_type_str.upper()
+            delta = opt_contract.greeks.delta
+
+            if "CALL" in c_type_upper:
+                if delta < self.config.call_delta_min or delta > self.config.call_delta_max:
+                    reasons.append(
+                        f"Delta de CALL fuera de rango permitido ({delta} no está en "
+                        f"[{self.config.call_delta_min}, {self.config.call_delta_max}])."
+                    )
+                    reason_codes.append(RiskReasonCode.ERR_DELTA_OUT_OF_BOUNDS)
+            elif "PUT" in c_type_upper:
+                if delta < self.config.put_delta_min or delta > self.config.put_delta_max:
+                    reasons.append(
+                        f"Delta de PUT fuera de rango permitido ({delta} no está en "
+                        f"[{self.config.put_delta_min}, {self.config.put_delta_max}])."
+                    )
+                    reason_codes.append(RiskReasonCode.ERR_DELTA_OUT_OF_BOUNDS)
+            else:
+                if abs(delta) < self.config.call_delta_min or abs(delta) > self.config.call_delta_max:
+                    reasons.append(f"Delta fuera de rango permitido ({delta}).")
+                    reason_codes.append(RiskReasonCode.ERR_DELTA_OUT_OF_BOUNDS)
+
+            # Decaimiento Theta
+            theta = opt_contract.greeks.theta
+            if opt_contract.ask_price > Decimal("0.0"):
+                theta_decay_rate = (abs(theta) / opt_contract.ask_price).quantize(
+                    Decimal("0.0001"), rounding=ROUND_HALF_UP
+                )
+                if theta_decay_rate > self.config.max_theta_decay_pct or abs(theta) > self.config.max_theta_absolute:
+                    reasons.append(
+                        f"Tasa de decaimiento Theta diaria excesiva ({theta_decay_rate * Decimal('100.0')}% > "
+                        f"{self.config.max_theta_decay_pct * Decimal('100.0')}% diario o |theta| > ${self.config.max_theta_absolute})."
+                    )
+                    reason_codes.append(RiskReasonCode.ERR_THETA_DECAY_EXCESSIVE)
+
+            # Volatilidad Implícita (IV)
+            iv = opt_contract.greeks.implied_volatility
+            if iv < self.config.min_iv or iv > self.config.max_iv:
+                reasons.append(
+                    f"Volatilidad Implícita (IV) fuera de rango ({iv} no está en "
+                    f"[{self.config.min_iv}, {self.config.max_iv}])."
+                )
+                reason_codes.extend([
+                    RiskReasonCode.ERR_IV_OUT_OF_BOUNDS,
+                    RiskReasonCode.ERR_IV_OUT_OF_RANGE,
+                ])
 
         # 6. Cálculo de Límites de Cuenta y Regla del 5%
         limits = calculate_trade_limits(
@@ -395,12 +534,19 @@ class RiskEngine:
             max_portfolio_risk_pct=self.config.max_portfolio_options_pct,
         )
 
-        effective_price = opt_contract.ask_price
-        if proposal.limit_price is not None and proposal.limit_price > effective_price:
-            effective_price = proposal.limit_price
+        if is_equity:
+            effective_price = eq_ask_dec
+            if proposal.limit_price is not None and proposal.limit_price > effective_price:
+                effective_price = proposal.limit_price
+            multiplier = Decimal("1")
+        else:
+            effective_price = opt_contract.ask_price
+            if proposal.limit_price is not None and proposal.limit_price > effective_price:
+                effective_price = proposal.limit_price
+            multiplier = Decimal("100")
 
         trade_cost = (
-            effective_price * Decimal("100") * Decimal(str(proposal.quantity))
+            effective_price * multiplier * Decimal(str(proposal.quantity))
         ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
         if limits.portfolio_value > Decimal("0.0"):
@@ -432,26 +578,38 @@ class RiskEngine:
             else:
                 reason_codes.append(RiskReasonCode.ERR_INSUFFICIENT_BUYING_POWER)
 
-        # Límite de exposición acumulada en opciones (25%)
-        new_total_options_exposure = exposure + trade_cost
-        if new_total_options_exposure > limits.max_total_options_allocation:
-            reasons.append(
-                f"La exposición acumulada en opciones (${new_total_options_exposure}) superaría el límite "
-                f"máximo permitido del {limits.max_portfolio_risk_pct * Decimal('100.0')}% "
-                f"(${limits.max_total_options_allocation})."
-            )
-            reason_codes.extend([
-                RiskReasonCode.ERR_EXCEEDS_25PCT_CUMULATIVE_OPTIONS_LIMIT,
-                RiskReasonCode.ERR_EXCEEDS_PORTFOLIO_OPTIONS_CAP,
-            ])
+        # Límite de exposición acumulada en opciones (25%) - SÓLO aplica a opciones
+        if not is_equity:
+            new_total_options_exposure = exposure + trade_cost
+            if new_total_options_exposure > limits.max_total_options_allocation:
+                reasons.append(
+                    f"La exposición acumulada en opciones (${new_total_options_exposure}) superaría el límite "
+                    f"máximo permitido del {limits.max_portfolio_risk_pct * Decimal('100.0')}% "
+                    f"(${limits.max_total_options_allocation})."
+                )
+                reason_codes.extend([
+                    RiskReasonCode.ERR_EXCEEDS_25PCT_CUMULATIVE_OPTIONS_LIMIT,
+                    RiskReasonCode.ERR_EXCEEDS_PORTFOLIO_OPTIONS_CAP,
+                ])
+        else:
+            new_total_options_exposure = exposure
 
-        # 7. Sizing Seguro Recomendado (Cantidad máxima de contratos permitida)
-        recommended_qty = self.calculate_max_safe_contracts(
-            contract=opt_contract,
-            max_budget=limits.effective_trade_budget,
-            current_options_exposure=exposure,
-            portfolio_value=limits.portfolio_value,
-        )
+        # 7. Sizing Seguro Recomendado (Cantidad máxima permitida)
+        if is_equity:
+            # Para acciones/ETFs: floor(budget / ask_price)
+            if eq_ask_dec > Decimal("0.0"):
+                recommended_qty = int(limits.effective_trade_budget // eq_ask_dec)
+            else:
+                recommended_qty = 0
+            recommended_qty = max(0, recommended_qty)
+        else:
+            # Para opciones: floor(budget / (ask_price * 100))
+            recommended_qty = self.calculate_max_safe_contracts(
+                contract=opt_contract,
+                max_budget=limits.effective_trade_budget,
+                current_options_exposure=exposure,
+                portfolio_value=limits.portfolio_value,
+            )
 
         is_approved = len(reasons) == 0
 
@@ -471,29 +629,60 @@ class RiskEngine:
             primary_reason_code = deduped_reason_codes[0] if deduped_reason_codes else RiskReasonCode.ERR_EXCEEDS_5PCT_SINGLE_TRADE_LIMIT
             summary_message = "; ".join(reasons)
 
-        audited_metrics: dict[str, Any] = {
-            "portfolio_value": str(snap.portfolio_value),
-            "buying_power": str(snap.buying_power),
-            "cash": str(snap.cash),
-            "trade_cost": str(trade_cost),
-            "max_allowed_risk": str(limits.max_single_trade_risk),
-            "max_allowed_budget": str(limits.effective_trade_budget),
-            "effective_budget": str(limits.effective_trade_budget),
-            "portfolio_risk_pct": str((portfolio_risk_pct * Decimal("100.0")).quantize(Decimal("0.01"))),
-            "portfolio_risk_pct_used": str(portfolio_risk_pct),
-            "current_options_exposure": str(exposure),
-            "projected_options_exposure": str(new_total_options_exposure),
-            "max_total_options_allocation": str(limits.max_total_options_allocation),
-            "spread_pct": str((opt_contract.bid_ask_spread_pct * Decimal("100.0")).quantize(Decimal("0.01"))),
-            "dte": opt_contract.dte,
-            "volume": opt_contract.volume,
-            "open_interest": opt_contract.open_interest,
-            "delta": str(opt_contract.greeks.delta),
-            "theta": str(opt_contract.greeks.theta),
-            "implied_volatility": str(opt_contract.greeks.implied_volatility),
-            "recommended_quantity": recommended_qty,
-            "max_safe_quantity": recommended_qty,
-        }
+        if is_equity:
+            audited_metrics: dict[str, Any] = {
+                "portfolio_value": str(snap.portfolio_value),
+                "buying_power": str(snap.buying_power),
+                "cash": str(snap.cash),
+                "trade_cost": str(trade_cost),
+                "max_allowed_risk": str(limits.max_single_trade_risk),
+                "max_allowed_budget": str(limits.effective_trade_budget),
+                "effective_budget": str(limits.effective_trade_budget),
+                "portfolio_risk_pct": str((portfolio_risk_pct * Decimal("100.0")).quantize(Decimal("0.01"))),
+                "portfolio_risk_pct_used": str(portfolio_risk_pct),
+                "current_options_exposure": str(exposure),
+                "projected_options_exposure": str(new_total_options_exposure),
+                "max_total_options_allocation": str(limits.max_total_options_allocation),
+                "spread_pct": str((rel_spread * Decimal("100.0")).quantize(Decimal("0.01"))),
+                "dte": 0,
+                "volume": 1000000,
+                "open_interest": 0,
+                "delta": "1.00",
+                "theta": "0.00",
+                "implied_volatility": "0.00",
+                "recommended_quantity": recommended_qty,
+                "max_safe_quantity": recommended_qty,
+                "asset_class": "equity",
+                "symbol": symbol,
+                "ask_price": str(eq_ask_dec),
+                "bid_price": str(eq_bid_dec),
+            }
+        else:
+            audited_metrics = {
+                "portfolio_value": str(snap.portfolio_value),
+                "buying_power": str(snap.buying_power),
+                "cash": str(snap.cash),
+                "trade_cost": str(trade_cost),
+                "max_allowed_risk": str(limits.max_single_trade_risk),
+                "max_allowed_budget": str(limits.effective_trade_budget),
+                "effective_budget": str(limits.effective_trade_budget),
+                "portfolio_risk_pct": str((portfolio_risk_pct * Decimal("100.0")).quantize(Decimal("0.01"))),
+                "portfolio_risk_pct_used": str(portfolio_risk_pct),
+                "current_options_exposure": str(exposure),
+                "projected_options_exposure": str(new_total_options_exposure),
+                "max_total_options_allocation": str(limits.max_total_options_allocation),
+                "spread_pct": str((opt_contract.bid_ask_spread_pct * Decimal("100.0")).quantize(Decimal("0.01"))),
+                "dte": opt_contract.dte,
+                "volume": opt_contract.volume,
+                "open_interest": opt_contract.open_interest,
+                "delta": str(opt_contract.greeks.delta),
+                "theta": str(opt_contract.greeks.theta),
+                "implied_volatility": str(opt_contract.greeks.implied_volatility),
+                "recommended_quantity": recommended_qty,
+                "max_safe_quantity": recommended_qty,
+                "asset_class": "option",
+                "symbol": opt_contract.symbol,
+            }
 
         return RiskVerdict(
             is_approved=is_approved,
@@ -509,4 +698,30 @@ class RiskEngine:
             warnings=warnings,
             recommended_quantity=recommended_qty,
             metrics_audited=audited_metrics,
+        )
+
+    def evaluate_trade(
+        self,
+        proposal: TradeProposal,
+        snapshot: Optional[AccountSnapshot] = None,
+        *args: Any,
+        contract: Optional[OptionContract] = None,
+        underlying_price: Optional[Decimal | Any] = None,
+        current_options_exposure: Decimal | Any = Decimal("0.0"),
+        account: Optional[AccountSnapshot] = None,
+        **kwargs: Any,
+    ) -> RiskVerdict:
+        """
+        Alias determinista y retrocompatible de evaluate_proposal.
+        Satisface todos los contratos de llamada históricos y extendidos.
+        """
+        return self.evaluate_proposal(
+            proposal=proposal,
+            snapshot=snapshot,
+            *args,
+            contract=contract,
+            underlying_price=underlying_price,
+            current_options_exposure=current_options_exposure,
+            account=account,
+            **kwargs,
         )

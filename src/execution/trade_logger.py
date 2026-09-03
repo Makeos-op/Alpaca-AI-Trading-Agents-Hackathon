@@ -46,7 +46,8 @@ class TradeLogEntry:
     execution_status: str = "REJECTED"  # FILLED / PENDING / REJECTED / SIMULATED / ERROR
     fill_price: Optional[Decimal] = None
     greeks: dict[str, Any] = field(default_factory=dict)
-    mode: str = "scan"  # dry-run / scan / loop
+    mode: str = "scan"  # dry-run / scan / loop / scalp
+    asset_class: str = "option"  # "option" | "equity" | "stock"
     market_data_snapshot: dict[str, Any] = field(default_factory=dict)
     agent_proposal: dict[str, Any] = field(default_factory=dict)
     risk_verdict: dict[str, Any] = field(default_factory=dict)
@@ -167,6 +168,7 @@ class TradeLogEntry:
             "execution_status": self.execution_status,
             "fill_price": str(self.fill_price) if self.fill_price is not None else None,
             "greeks": self.greeks,
+            "asset_class": self.asset_class,
         }
 
     @classmethod
@@ -180,6 +182,7 @@ class TradeLogEntry:
         ticker = data.get("ticker") or market_snap.get("ticker") or market_snap.get("underlying_symbol", "")
         option_symbol = data.get("option_symbol") or market_snap.get("option_symbol") or prop_snap.get("target_contract_symbol", "")
         contract_type = data.get("contract_type") or prop_snap.get("target_option_type", "CALL")
+        asset_class = data.get("asset_class") or ("equity" if str(contract_type).upper() in ("EQUITY", "STOCK") else "option")
 
         strike_price_raw = data.get("strike_price") or market_snap.get("underlying_price", "0.0")
         strike_price = to_decimal(strike_price_raw)
@@ -231,6 +234,7 @@ class TradeLogEntry:
             fill_price=fill_price,
             greeks=greeks,
             mode=mode,
+            asset_class=asset_class,
             market_data_snapshot=market_snap,
             agent_proposal=prop_snap,
             risk_verdict=verdict_snap,
@@ -261,11 +265,14 @@ class TradeLogger:
         mode: str = "scan",
         underlying_price: Optional[Decimal] = None,
     ) -> TradeLogEntry:
-        """Registra una orden de opciones aprobada y ejecutada/simulada."""
+        """Registra una orden aprobada (opciones o acciones) y ejecutada/simulada."""
         contract = proposal.contract
+        is_equity = (
+            getattr(proposal, "is_equity", False)
+            or (getattr(proposal, "asset_class", "option") or "option").lower() in ("equity", "stock")
+            or contract is None
+        )
         now_iso = datetime.now(timezone.utc).isoformat()
-        u_price = underlying_price or getattr(contract, "underlying_price", None) or contract.strike_price
-        f_price = fill_price or contract.ask_price
 
         if status == "SIMULATED" or mode == "dry-run":
             event_type = "TRADE_SIMULATED"
@@ -274,43 +281,121 @@ class TradeLogger:
             event_type = "TRADE_EXECUTED"
             actual_mode = mode
 
-        market_data_snapshot = {
-            "ticker": contract.underlying_symbol,
-            "underlying_symbol": contract.underlying_symbol,
-            "underlying_price": str(u_price),
-            "option_symbol": contract.symbol,
-            "bid": str(contract.bid_price),
-            "bid_price": str(contract.bid_price),
-            "ask": str(contract.ask_price),
-            "ask_price": str(contract.ask_price),
-            "mid_price": str(contract.mid_price),
-            "spread_pct": str(contract.bid_ask_spread_pct),
-            "volume": contract.volume,
-            "open_interest": contract.open_interest,
-            "delta": str(contract.greeks.delta),
-            "theta": str(contract.greeks.theta),
-            "dte": contract.dte,
-            "greeks": contract.greeks.to_dict(),
-        }
+        if is_equity:
+            ticker = (
+                getattr(proposal, "underlying_symbol", None)
+                or getattr(proposal, "symbol", None)
+                or (contract.underlying_symbol if contract else "SPY")
+            )
+            option_symbol = getattr(proposal, "symbol", None) or (contract.symbol if contract else ticker)
+            target_opt_type = "EQUITY"
+            eq_price = (
+                underlying_price
+                or (contract.strike_price if contract else None)
+                or getattr(proposal, "price", None)
+                or getattr(proposal, "ask_price", None)
+                or Decimal("100.00")
+            )
+            u_price = to_decimal(eq_price)
+            f_price = to_decimal(fill_price or getattr(proposal, "ask_price", None) or u_price)
+            eq_bid = to_decimal(getattr(proposal, "bid_price", None) or f_price)
+            eq_ask = to_decimal(getattr(proposal, "ask_price", None) or f_price)
+            abs_spread = abs(eq_ask - eq_bid)
+            mid_p = (eq_ask + eq_bid) / Decimal("2.0")
+            spread_pct_val = str((abs_spread / mid_p).quantize(Decimal("0.0001"))) if mid_p > Decimal("0.0") else "0.0000"
 
-        target_opt_type = (
-            contract.contract_type.value
-            if hasattr(contract.contract_type, "value")
-            else str(contract.contract_type)
-        )
-        action_val = proposal.action or getattr(proposal, "side", "BUY") or "BUY"
-        agent_proposal = {
-            "strategy_name": proposal.strategy_name,
-            "signal_type": getattr(proposal, "signal_type", "BULLISH_CALL_MOMENTUM") or "BULLISH_CALL_MOMENTUM",
-            "confidence": str(getattr(proposal, "confidence", "0.85")),
-            "target_contract_symbol": contract.symbol,
-            "target_option_type": target_opt_type,
-            "action": action_val.upper(),
-            "quantity": proposal.quantity,
-            "symbol": contract.symbol,
-            "side": action_val.lower(),
-            "rationale": getattr(proposal, "rationale", "") or proposal.strategy_name,
-        }
+            contract_strike = u_price
+            contract_exp = "N/A"
+            contract_dte = 0
+            contract_greeks = {
+                "delta": "1.00",
+                "gamma": "0.00",
+                "theta": "0.00",
+                "vega": "0.00",
+                "implied_volatility": "0.00",
+            }
+
+            market_data_snapshot = {
+                "ticker": ticker,
+                "underlying_symbol": ticker,
+                "underlying_price": str(u_price),
+                "option_symbol": option_symbol,
+                "bid": str(eq_bid),
+                "bid_price": str(eq_bid),
+                "ask": str(eq_ask),
+                "ask_price": str(eq_ask),
+                "mid_price": str(mid_p),
+                "spread_pct": spread_pct_val,
+                "volume": 1000000,
+                "open_interest": 0,
+                "delta": "1.00",
+                "theta": "0.00",
+                "dte": 0,
+                "greeks": contract_greeks,
+            }
+
+            action_val = proposal.action or getattr(proposal, "side", "BUY") or "BUY"
+            agent_proposal = {
+                "strategy_name": proposal.strategy_name,
+                "signal_type": getattr(proposal, "signal_type", None) or "BULLISH_EQUITY_MOMENTUM",
+                "confidence": str(getattr(proposal, "confidence", None) or "0.85"),
+                "target_contract_symbol": option_symbol,
+                "target_option_type": target_opt_type,
+                "action": action_val.upper(),
+                "quantity": max(1, proposal.quantity),
+                "symbol": option_symbol,
+                "side": action_val.lower(),
+                "rationale": getattr(proposal, "rationale", "") or proposal.strategy_name,
+            }
+
+        else:
+            u_price = underlying_price or getattr(contract, "underlying_price", None) or contract.strike_price
+            f_price = fill_price or contract.ask_price
+            ticker = contract.underlying_symbol
+            option_symbol = contract.symbol
+            target_opt_type = (
+                contract.contract_type.value
+                if hasattr(contract.contract_type, "value")
+                else str(contract.contract_type)
+            )
+            action_val = proposal.action or getattr(proposal, "side", "BUY") or "BUY"
+
+            contract_strike = contract.strike_price
+            contract_exp = contract.expiration_date
+            contract_dte = contract.dte
+            contract_greeks = contract.greeks.to_dict()
+
+            market_data_snapshot = {
+                "ticker": contract.underlying_symbol,
+                "underlying_symbol": contract.underlying_symbol,
+                "underlying_price": str(u_price),
+                "option_symbol": contract.symbol,
+                "bid": str(contract.bid_price),
+                "bid_price": str(contract.bid_price),
+                "ask": str(contract.ask_price),
+                "ask_price": str(contract.ask_price),
+                "mid_price": str(contract.mid_price),
+                "spread_pct": str(contract.bid_ask_spread_pct),
+                "volume": contract.volume,
+                "open_interest": contract.open_interest,
+                "delta": str(contract.greeks.delta),
+                "theta": str(contract.greeks.theta),
+                "dte": contract.dte,
+                "greeks": contract_greeks,
+            }
+
+            agent_proposal = {
+                "strategy_name": proposal.strategy_name,
+                "signal_type": getattr(proposal, "signal_type", "BULLISH_CALL_MOMENTUM") or "BULLISH_CALL_MOMENTUM",
+                "confidence": str(getattr(proposal, "confidence", "0.85")),
+                "target_contract_symbol": contract.symbol,
+                "target_option_type": target_opt_type,
+                "action": action_val.upper(),
+                "quantity": proposal.quantity,
+                "symbol": contract.symbol,
+                "side": action_val.lower(),
+                "rationale": getattr(proposal, "rationale", "") or proposal.strategy_name,
+            }
 
         rc_val = verdict.reason_code.value if hasattr(verdict.reason_code, "value") else str(verdict.reason_code)
         rc_list = [rc.value if hasattr(rc, "value") else str(rc) for rc in verdict.reason_codes]
@@ -328,8 +413,8 @@ class TradeLogger:
                 "trade_cost": float(verdict.trade_cost),
                 "max_allowed_risk": float(verdict.max_allowed_budget),
                 "portfolio_risk_pct": float(verdict.portfolio_risk_pct_used) * 100.0,
-                "spread_pct": float(contract.bid_ask_spread_pct) * 100.0,
-                "dte": contract.dte,
+                "spread_pct": float(market_data_snapshot.get("spread_pct", 0.0)) * 100.0,
+                "dte": contract_dte,
             },
         }
 
@@ -345,12 +430,12 @@ class TradeLogger:
         entry = TradeLogEntry(
             timestamp=now_iso,
             event_type=event_type,
-            ticker=contract.underlying_symbol,
-            option_symbol=contract.symbol,
+            ticker=ticker,
+            option_symbol=option_symbol,
             contract_type=target_opt_type,
-            strike_price=contract.strike_price,
-            expiration_date=contract.expiration_date,
-            dte=contract.dte,
+            strike_price=contract_strike,
+            expiration_date=contract_exp,
+            dte=contract_dte,
             quantity=proposal.quantity,
             trade_cost=verdict.trade_cost,
             strategy_name=proposal.strategy_name,
@@ -362,8 +447,9 @@ class TradeLogger:
             order_id=order_id,
             execution_status=status,
             fill_price=f_price,
-            greeks=contract.greeks.to_dict(),
+            greeks=contract_greeks,
             mode=actual_mode,
+            asset_class="equity" if is_equity else "option",
             market_data_snapshot=market_data_snapshot,
             agent_proposal=agent_proposal,
             risk_verdict=risk_verdict_dict,
@@ -382,46 +468,127 @@ class TradeLogger:
     ) -> TradeLogEntry:
         """Registra una propuesta de trade rechazada o cancelada por el Risk Engine."""
         contract = proposal.contract
-        now_iso = datetime.now(timezone.utc).isoformat()
-        u_price = underlying_price or getattr(contract, "underlying_price", None) or contract.strike_price
-
-        market_data_snapshot = {
-            "ticker": contract.underlying_symbol,
-            "underlying_symbol": contract.underlying_symbol,
-            "underlying_price": str(u_price),
-            "option_symbol": contract.symbol,
-            "bid": str(contract.bid_price),
-            "bid_price": str(contract.bid_price),
-            "ask": str(contract.ask_price),
-            "ask_price": str(contract.ask_price),
-            "mid_price": str(contract.mid_price),
-            "spread_pct": str(contract.bid_ask_spread_pct),
-            "volume": contract.volume,
-            "open_interest": contract.open_interest,
-            "delta": str(contract.greeks.delta),
-            "theta": str(contract.greeks.theta),
-            "dte": contract.dte,
-            "greeks": contract.greeks.to_dict(),
-        }
-
-        target_opt_type = (
-            contract.contract_type.value
-            if hasattr(contract.contract_type, "value")
-            else str(contract.contract_type)
+        is_equity = (
+            getattr(proposal, "is_equity", False)
+            or (getattr(proposal, "asset_class", "option") or "option").lower() in ("equity", "stock")
+            or contract is None
         )
-        action_val = proposal.action or getattr(proposal, "side", "BUY") or "BUY"
-        agent_proposal = {
-            "strategy_name": proposal.strategy_name,
-            "signal_type": getattr(proposal, "signal_type", "BULLISH_CALL_MOMENTUM") or "BULLISH_CALL_MOMENTUM",
-            "confidence": str(getattr(proposal, "confidence", "0.85")),
-            "target_contract_symbol": contract.symbol,
-            "target_option_type": target_opt_type,
-            "action": action_val.upper(),
-            "quantity": proposal.quantity,
-            "symbol": contract.symbol,
-            "side": action_val.lower(),
-            "rationale": getattr(proposal, "rationale", "") or proposal.strategy_name,
-        }
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        if is_equity:
+            ticker = (
+                getattr(proposal, "underlying_symbol", None)
+                or getattr(proposal, "symbol", None)
+                or (contract.underlying_symbol if contract else "SPY")
+            )
+            option_symbol = getattr(proposal, "symbol", None) or (contract.symbol if contract else ticker)
+            target_opt_type = "EQUITY"
+            eq_price = (
+                underlying_price
+                or (contract.strike_price if contract else None)
+                or getattr(proposal, "price", None)
+                or getattr(proposal, "ask_price", None)
+                or Decimal("100.00")
+            )
+            u_price = to_decimal(eq_price)
+            f_price = None
+            eq_bid = to_decimal(getattr(proposal, "bid_price", None) or u_price)
+            eq_ask = to_decimal(getattr(proposal, "ask_price", None) or u_price)
+            abs_spread = abs(eq_ask - eq_bid)
+            mid_p = (eq_ask + eq_bid) / Decimal("2.0")
+            spread_pct_val = str((abs_spread / mid_p).quantize(Decimal("0.0001"))) if mid_p > Decimal("0.0") else "0.0000"
+
+            contract_strike = u_price
+            contract_exp = "N/A"
+            contract_dte = 0
+            contract_greeks = {
+                "delta": "1.00",
+                "gamma": "0.00",
+                "theta": "0.00",
+                "vega": "0.00",
+                "implied_volatility": "0.00",
+            }
+
+            market_data_snapshot = {
+                "ticker": ticker,
+                "underlying_symbol": ticker,
+                "underlying_price": str(u_price),
+                "option_symbol": option_symbol,
+                "bid": str(eq_bid),
+                "bid_price": str(eq_bid),
+                "ask": str(eq_ask),
+                "ask_price": str(eq_ask),
+                "mid_price": str(mid_p),
+                "spread_pct": spread_pct_val,
+                "volume": 1000000,
+                "open_interest": 0,
+                "delta": "1.00",
+                "theta": "0.00",
+                "dte": 0,
+                "greeks": contract_greeks,
+            }
+
+            action_val = proposal.action or getattr(proposal, "side", "BUY") or "BUY"
+            agent_proposal = {
+                "strategy_name": proposal.strategy_name,
+                "signal_type": getattr(proposal, "signal_type", None) or "BULLISH_EQUITY_MOMENTUM",
+                "confidence": str(getattr(proposal, "confidence", None) or "0.85"),
+                "target_contract_symbol": option_symbol,
+                "target_option_type": target_opt_type,
+                "action": action_val.upper(),
+                "quantity": max(1, proposal.quantity),
+                "symbol": option_symbol,
+                "side": action_val.lower(),
+                "rationale": getattr(proposal, "rationale", "") or proposal.strategy_name,
+            }
+
+        else:
+            u_price = underlying_price or getattr(contract, "underlying_price", None) or contract.strike_price
+            ticker = contract.underlying_symbol
+            option_symbol = contract.symbol
+            target_opt_type = (
+                contract.contract_type.value
+                if hasattr(contract.contract_type, "value")
+                else str(contract.contract_type)
+            )
+            action_val = proposal.action or getattr(proposal, "side", "BUY") or "BUY"
+
+            contract_strike = contract.strike_price
+            contract_exp = contract.expiration_date
+            contract_dte = contract.dte
+            contract_greeks = contract.greeks.to_dict()
+
+            market_data_snapshot = {
+                "ticker": contract.underlying_symbol,
+                "underlying_symbol": contract.underlying_symbol,
+                "underlying_price": str(u_price),
+                "option_symbol": contract.symbol,
+                "bid": str(contract.bid_price),
+                "bid_price": str(contract.bid_price),
+                "ask": str(contract.ask_price),
+                "ask_price": str(contract.ask_price),
+                "mid_price": str(contract.mid_price),
+                "spread_pct": str(contract.bid_ask_spread_pct),
+                "volume": contract.volume,
+                "open_interest": contract.open_interest,
+                "delta": str(contract.greeks.delta),
+                "theta": str(contract.greeks.theta),
+                "dte": contract.dte,
+                "greeks": contract_greeks,
+            }
+
+            agent_proposal = {
+                "strategy_name": proposal.strategy_name,
+                "signal_type": getattr(proposal, "signal_type", "BULLISH_CALL_MOMENTUM") or "BULLISH_CALL_MOMENTUM",
+                "confidence": str(getattr(proposal, "confidence", "0.85")),
+                "target_contract_symbol": contract.symbol,
+                "target_option_type": target_opt_type,
+                "action": action_val.upper(),
+                "quantity": proposal.quantity,
+                "symbol": contract.symbol,
+                "side": action_val.lower(),
+                "rationale": getattr(proposal, "rationale", "") or proposal.strategy_name,
+            }
 
         rc_val = verdict.reason_code.value if hasattr(verdict.reason_code, "value") else str(verdict.reason_code)
         rc_list = [rc.value if hasattr(rc, "value") else str(rc) for rc in verdict.reason_codes]
@@ -439,8 +606,8 @@ class TradeLogger:
                 "trade_cost": float(verdict.trade_cost),
                 "max_allowed_risk": float(verdict.max_allowed_budget),
                 "portfolio_risk_pct": float(verdict.portfolio_risk_pct_used) * 100.0,
-                "spread_pct": float(contract.bid_ask_spread_pct) * 100.0,
-                "dte": contract.dte,
+                "spread_pct": float(market_data_snapshot.get("spread_pct", 0.0)) * 100.0,
+                "dte": contract_dte,
             },
         }
 
@@ -456,12 +623,12 @@ class TradeLogger:
         entry = TradeLogEntry(
             timestamp=now_iso,
             event_type="TRADE_REJECTED",
-            ticker=contract.underlying_symbol,
-            option_symbol=contract.symbol,
+            ticker=ticker,
+            option_symbol=option_symbol,
             contract_type=target_opt_type,
-            strike_price=contract.strike_price,
-            expiration_date=contract.expiration_date,
-            dte=contract.dte,
+            strike_price=contract_strike,
+            expiration_date=contract_exp,
+            dte=contract_dte,
             quantity=proposal.quantity,
             trade_cost=verdict.trade_cost,
             strategy_name=proposal.strategy_name,
@@ -473,8 +640,9 @@ class TradeLogger:
             order_id=None,
             execution_status="REJECTED",
             fill_price=None,
-            greeks=contract.greeks.to_dict(),
+            greeks=contract_greeks,
             mode=mode,
+            asset_class="equity" if is_equity else "option",
             market_data_snapshot=market_data_snapshot,
             agent_proposal=agent_proposal,
             risk_verdict=risk_verdict_dict,

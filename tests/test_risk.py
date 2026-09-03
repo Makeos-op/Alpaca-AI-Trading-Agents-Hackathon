@@ -1050,6 +1050,145 @@ class TestOriginalRiskEngine(unittest.TestCase):
         self.assertFalse(verdict.is_approved)
         self.assertTrue(any("exposición acumulada en opciones" in r for r in verdict.reasons))
 
+    # ==========================================================================
+    # Equity Risk Evaluation Tests (Multi-Asset Expansion)
+    # ==========================================================================
+
+    def test_equity_proposal_1x_multiplier_and_5_percent_limit_approved(self):
+        """Verifica que el costo de acciones use multiplicador 1x y apruebe trades <= 5% ($5,000)."""
+        # 10 acciones x $500.00 x 1 = $5,000.00 (exactamente 5% de $100,000)
+        proposal = TradeProposal(
+            symbol="SPY",
+            quantity=10,
+            asset_class="equity",
+            price=Decimal("500.00"),
+            ask_price=Decimal("500.00"),
+            bid_price=Decimal("499.90"),
+            strategy_name="ScalpEquity",
+            action="BUY",
+        )
+        verdict = self.risk_engine.evaluate_proposal(proposal, self.healthy_snapshot)
+        self.assertTrue(verdict.is_approved)
+        self.assertEqual(verdict.reason_code, RiskReasonCode.APPROVED)
+        self.assertEqual(verdict.trade_cost, Decimal("5000.00"))
+        self.assertEqual(verdict.max_allowed_budget, Decimal("5000.00"))
+        self.assertEqual(verdict.portfolio_risk_pct_used, Decimal("0.0500"))
+
+    def test_equity_proposal_1x_multiplier_exceeds_5_percent_rejected(self):
+        """Verifica que 11 acciones de $500 ($5,500 > $5,000) sea rechazado por regla del 5%."""
+        # 11 acciones x $500.00 x 1 = $5,500.00 (> $5,000.00)
+        proposal = TradeProposal(
+            symbol="SPY",
+            quantity=11,
+            asset_class="equity",
+            price=Decimal("500.00"),
+            ask_price=Decimal("500.00"),
+            bid_price=Decimal("499.90"),
+            strategy_name="ScalpEquity",
+            action="BUY",
+        )
+        verdict = self.risk_engine.evaluate_proposal(proposal, self.healthy_snapshot)
+        self.assertFalse(verdict.is_approved)
+        self.assertEqual(verdict.reason_code, RiskReasonCode.ERR_EXCEEDS_5PCT_SINGLE_TRADE_LIMIT)
+        self.assertEqual(verdict.trade_cost, Decimal("5500.00"))
+        self.assertEqual(verdict.recommended_quantity, 10)
+
+    def test_equity_proposal_bypasses_greeks_and_dte_filters(self):
+        """Verifica que las propuestas de acciones no requieran DTE, Delta, Theta ni Open Interest."""
+        proposal = TradeProposal(
+            symbol="AAPL",
+            quantity=5,
+            asset_class="equity",
+            price=Decimal("220.00"),
+            ask_price=Decimal("220.05"),
+            bid_price=Decimal("220.00"),
+            strategy_name="QuickTrade",
+            action="BUY",
+        )
+        # No hay OptionContract, no hay griegas, ni DTE
+        verdict = self.risk_engine.evaluate_proposal(proposal, self.healthy_snapshot)
+        self.assertTrue(verdict.is_approved)
+        self.assertEqual(verdict.reason_code, RiskReasonCode.APPROVED)
+        # Verificar que no hay razones de rechazo relacionadas con opciones
+        for r in verdict.reasons:
+            self.assertNotIn("DTE", r)
+            self.assertNotIn("Delta", r)
+            self.assertNotIn("Theta", r)
+            self.assertNotIn("Open Interest", r)
+
+    def test_equity_proposal_bid_ask_spread_relative_excessive_rejected(self):
+        """Verifica que un spread relativo > 5.00% en acciones sea rechazado."""
+        # Ask $10.60, Bid $10.00 -> spread $0.60 / mid $10.30 = 5.83% > 5.00%
+        proposal = TradeProposal(
+            symbol="PENNY",
+            quantity=10,
+            asset_class="equity",
+            price=Decimal("10.30"),
+            ask_price=Decimal("10.60"),
+            bid_price=Decimal("10.00"),
+            strategy_name="TestSpread",
+        )
+        verdict = self.risk_engine.evaluate_proposal(proposal, self.healthy_snapshot)
+        self.assertFalse(verdict.is_approved)
+        self.assertIn(RiskReasonCode.ERR_WIDE_BID_ASK_SPREAD, verdict.reason_codes)
+
+    def test_equity_proposal_bid_ask_spread_absolute_excessive_rejected(self):
+        """Verifica que un spread absoluto > $0.50 en acciones sea rechazado."""
+        # Ask $500.60, Bid $500.00 -> spread $0.60 > $0.50 (aunque relativo sea 0.12%)
+        proposal = TradeProposal(
+            symbol="SPY",
+            quantity=1,
+            asset_class="equity",
+            price=Decimal("500.30"),
+            ask_price=Decimal("500.60"),
+            bid_price=Decimal("500.00"),
+            strategy_name="TestSpread",
+        )
+        verdict = self.risk_engine.evaluate_proposal(proposal, self.healthy_snapshot)
+        self.assertFalse(verdict.is_approved)
+        self.assertIn(RiskReasonCode.ERR_WIDE_BID_ASK_SPREAD, verdict.reason_codes)
+
+    def test_equity_proposal_crossed_quote_rejected(self):
+        """Verifica que cotizaciones cruzadas (Ask < Bid) en acciones sean rechazadas."""
+        proposal = TradeProposal(
+            symbol="SPY",
+            quantity=1,
+            asset_class="equity",
+            price=Decimal("500.00"),
+            ask_price=Decimal("499.50"),
+            bid_price=Decimal("500.50"),
+            strategy_name="CrossedTest",
+        )
+        verdict = self.risk_engine.evaluate_proposal(proposal, self.healthy_snapshot)
+        self.assertFalse(verdict.is_approved)
+        self.assertIn(RiskReasonCode.ERR_CROSSED_OR_ZERO_QUOTE, verdict.reason_codes)
+
+    def test_equity_safe_quantity_calculation(self):
+        """Verifica el cálculo de cantidad segura máxima para acciones vs opciones."""
+        # Para acciones: presupuesto $5,000 / precio $200.00 = 25 acciones
+        safe_qty_eq = self.risk_engine.calculate_max_safe_quantity(
+            price=Decimal("200.00"),
+            budget=Decimal("5000.00"),
+            asset_class="equity",
+        )
+        self.assertEqual(safe_qty_eq, 25)
+
+        # Para opciones: presupuesto $5,000 / (precio $2.00 x 100) = 25 contratos
+        safe_qty_opt = self.risk_engine.calculate_max_safe_quantity(
+            price=Decimal("2.00"),
+            budget=Decimal("5000.00"),
+            asset_class="option",
+        )
+        self.assertEqual(safe_qty_opt, 25)
+
+        # Para opciones con precio $200.00 / acción -> $20,000 / contrato -> 0 contratos
+        safe_qty_opt_expensive = self.risk_engine.calculate_max_safe_quantity(
+            price=Decimal("200.00"),
+            budget=Decimal("5000.00"),
+            asset_class="option",
+        )
+        self.assertEqual(safe_qty_opt_expensive, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

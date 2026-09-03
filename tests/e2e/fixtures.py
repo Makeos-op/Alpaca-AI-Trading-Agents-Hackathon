@@ -473,7 +473,7 @@ class Draft07SchemaValidator:
 
         # Validate mode
         mode = record.get("mode")
-        if mode not in ["dry-run", "scan", "loop"]:
+        if mode not in ["dry-run", "scan", "loop", "scalp"]:
             errors.append(f"Invalid mode: '{mode}'")
 
         # Validate market_data_snapshot
@@ -570,8 +570,11 @@ class MockMCPStdioProtocolSimulator:
                     "tools": [
                         {"name": "get_account", "description": "Get Alpaca account snapshot"},
                         {"name": "get_clock", "description": "Get market clock"},
+                        {"name": "get_calendar", "description": "Get market calendar"},
                         {"name": "get_option_chain", "description": "Get options chain"},
                         {"name": "submit_option_order", "description": "Submit option order"},
+                        {"name": "place_stock_order", "description": "Place stock or ETF order"},
+                        {"name": "place_option_order", "description": "Place option contract order"},
                     ]
                 },
             })
@@ -606,6 +609,15 @@ class MockMCPStdioProtocolSimulator:
                     },
                 })
 
+            elif tool_name == "get_calendar":
+                return json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": [
+                        {"date": "2026-09-03", "open": "09:30", "close": "16:00", "session_open": "0400", "session_close": "2000"}
+                    ],
+                })
+
             elif tool_name == "get_option_chain":
                 underlying = args.get("underlying", "SPY")
                 return json.dumps({
@@ -631,7 +643,7 @@ class MockMCPStdioProtocolSimulator:
                     },
                 })
 
-            elif tool_name == "submit_option_order":
+            elif tool_name in ["submit_option_order", "place_option_order", "place_stock_order"]:
                 if self.fail_on_order:
                     return json.dumps({
                         "jsonrpc": "2.0",
@@ -672,7 +684,7 @@ class MockCLIRunnerSimulator:
 
         subcmd = args[0]
         if subcmd == "account":
-            if "--json" in args:
+            if "--json" in args or "get" in args:
                 return 0, json.dumps({
                     "id": "acc-cli-12345",
                     "portfolio_value": "100000.00",
@@ -693,13 +705,28 @@ class MockCLIRunnerSimulator:
                 }), ""
             return 0, "Market is OPEN", ""
 
+        elif subcmd == "profile":
+            if "login" in args:
+                return 0, "Profile default logged in successfully", ""
+            return 0, "default", ""
+
         elif subcmd == "order":
-            if "place" in args:
+            if "place" in args or "submit" in args:
+                sym = "SPY260930C00500000"
+                qty = 5
+                for i, a in enumerate(args):
+                    if a == "--symbol" and i + 1 < len(args):
+                        sym = args[i + 1]
+                    elif a == "--qty" and i + 1 < len(args):
+                        try:
+                            qty = int(args[i + 1])
+                        except ValueError:
+                            qty = 1
                 return 0, json.dumps({
                     "id": "cli-order-abcdef",
                     "status": "accepted",
-                    "symbol": "SPY260930C00500000",
-                    "qty": 5,
+                    "symbol": sym,
+                    "qty": qty,
                 }), ""
 
         return 1, "", f"Unknown CLI command: {' '.join(args)}"

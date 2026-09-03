@@ -170,6 +170,58 @@ class TestTradeLogger(unittest.TestCase):
         self.assertEqual(logger.get_trade_history(limit=0), [])
         self.assertEqual(logger.get_trade_history(limit=-5), [])
 
+    def test_draft07_structured_logging_scalp_mode(self):
+        """Verifica que TradeLogger registre eventos con mode='scalp' cumpliendo Draft-07."""
+        # 1. Trade ejecutado en modo scalp (acciones)
+        equity_prop = TradeProposal(
+            symbol="SPY",
+            quantity=1,
+            strategy_name="ScalpFastMomentum",
+            action="BUY",
+            asset_class="equity",
+            price=Decimal("500.00"),
+            ask_price=Decimal("500.05"),
+            bid_price=Decimal("500.00"),
+        )
+        verdict = RiskVerdict(
+            is_approved=True,
+            trade_cost=Decimal("500.05"),
+            max_allowed_budget=Decimal("5000.00"),
+            portfolio_risk_pct_used=Decimal("0.0050"),
+        )
+        entry_exec = self.logger.log_executed_trade(
+            proposal=equity_prop,
+            verdict=verdict,
+            order_id="scalp-ord-001",
+            fill_price=Decimal("500.05"),
+            mode="scalp",
+        )
+        self.assertEqual(entry_exec.mode, "scalp")
+        self.assertEqual(entry_exec.asset_class, "equity")
+        d_exec = entry_exec.to_dict()
+        self.assertEqual(d_exec["mode"], "scalp")
+        is_valid, errors = Draft07SchemaValidator.validate(d_exec)
+        self.assertTrue(is_valid, f"Errores Draft-07 en trade ejecutado scalp: {errors}")
+
+        # 2. Trade rechazado en modo scalp
+        verdict_rej = RiskVerdict(
+            is_approved=False,
+            trade_cost=Decimal("6000.00"),
+            max_allowed_budget=Decimal("5000.00"),
+            portfolio_risk_pct_used=Decimal("0.0600"),
+            reasons=["El costo excede el 5%"],
+        )
+        entry_rej = self.logger.log_rejected_trade(
+            proposal=equity_prop,
+            verdict=verdict_rej,
+            mode="scalp",
+        )
+        self.assertEqual(entry_rej.mode, "scalp")
+        d_rej = entry_rej.to_dict()
+        self.assertEqual(d_rej["mode"], "scalp")
+        is_valid_rej, errors_rej = Draft07SchemaValidator.validate(d_rej)
+        self.assertTrue(is_valid_rej, f"Errores Draft-07 en trade rechazado scalp: {errors_rej}")
+
 
 class TestOptionExecutor(unittest.TestCase):
     """Pruebas del ejecutor de órdenes de opciones y validación pre-trade."""
@@ -319,6 +371,109 @@ class TestOptionExecutor(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.status, "ERROR")
         self.assertIn("Conexión rechazada por Alpaca", result.error_message)
+
+    def test_executor_equity_order_execution(self):
+        """Verifica que OptionExecutor despache órdenes de acciones correctamente."""
+        mock_gw = MagicMock(spec=AlpacaGateway)
+        mock_gw.submit_stock_order.return_value = {
+            "id": "ord-stk-101",
+            "order_id": "ord-stk-101",
+            "status": "filled",
+            "filled_avg_price": "500.00",
+            "symbol": "SPY",
+            "qty": "5",
+            "side": "buy",
+        }
+        executor = OptionExecutor(gateway=mock_gw, logger=self.logger)
+
+        equity_prop = TradeProposal(
+            symbol="SPY",
+            quantity=5,
+            asset_class="equity",
+            price=Decimal("500.00"),
+            ask_price=Decimal("500.00"),
+            bid_price=Decimal("499.95"),
+            strategy_name="ScalpEquityTest",
+            action="BUY",
+        )
+        verdict = RiskVerdict(
+            is_approved=True,
+            trade_cost=Decimal("2500.00"),
+            max_allowed_budget=Decimal("5000.00"),
+            portfolio_risk_pct_used=Decimal("0.0250"),
+        )
+
+        result = executor.execute_approved_trade(equity_prop, verdict)
+        self.assertTrue(result.success)
+        self.assertEqual(result.status, "FILLED")
+        self.assertEqual(result.order_id, "ord-stk-101")
+        self.assertEqual(result.symbol, "SPY")
+        self.assertEqual(result.quantity, 5)
+
+        # Verificar que se llamó submit_stock_order (o submit_order) y no submit_option_order
+        self.assertTrue(mock_gw.submit_stock_order.called or mock_gw.submit_order.called)
+        mock_gw.submit_option_order.assert_not_called()
+
+    def test_executor_fallback_to_equity_success_and_rejection(self):
+        """Verifica fallback determinista a acciones cuando opciones son ilíquidas o no disponibles."""
+        mock_gw = MagicMock(spec=AlpacaGateway)
+        mock_gw.submit_stock_order.return_value = {
+            "id": "ord-fallback-202",
+            "order_id": "ord-fallback-202",
+            "status": "filled",
+            "filled_avg_price": "500.00",
+            "symbol": "SPY",
+            "qty": "2",
+            "side": "buy",
+        }
+        executor = OptionExecutor(gateway=mock_gw, logger=self.logger)
+
+        snapshot = AccountSnapshot(
+            account_id="acc-fallback",
+            cash=Decimal("50000.00"),
+            portfolio_value=Decimal("100000.00"),
+            buying_power=Decimal("50000.00"),
+            equity=Decimal("100000.00"),
+            long_market_value=Decimal("50000.00"),
+            short_market_value=Decimal("0.00"),
+            initial_margin=Decimal("0.00"),
+            maintenance_margin=Decimal("0.00"),
+            daytrading_buying_power=Decimal("50000.00"),
+            daytrading_count=0,
+            is_daytrader=False,
+            is_active=True,
+            is_frozen=False,
+        )
+
+        # 1. Fallback exitoso (2 acciones de SPY x $500 = $1,000 <= $5,000 5% límite)
+        res_ok = executor.fallback_to_equity(
+            proposal=self.proposal,
+            account=snapshot,
+            risk_engine=RiskEngine(),
+            underlying_price=Decimal("500.00"),
+            fallback_symbol="SPY",
+            quantity=2,
+        )
+        self.assertTrue(res_ok.success)
+        self.assertEqual(res_ok.status, "FILLED")
+        self.assertEqual(res_ok.order_id, "ord-fallback-202")
+        self.assertEqual(res_ok.symbol, "SPY")
+        self.assertEqual(res_ok.quantity, 2)
+
+        # 2. Fallback rechazado por exceder límite del 5% (50 acciones x $500 = $25,000 > $5,000)
+        res_rej = executor.fallback_to_equity(
+            proposal=self.proposal,
+            account=snapshot,
+            risk_engine=RiskEngine(),
+            underlying_price=Decimal("500.00"),
+            fallback_symbol="SPY",
+            quantity=50,
+        )
+        self.assertFalse(res_rej.success)
+        self.assertEqual(res_rej.status, "REJECTED")
+        self.assertIn("Risk Engine", res_rej.error_message)
+        # Broker no debe haber sido llamado para la orden rechazada
+        self.assertEqual(mock_gw.submit_stock_order.call_count, 1)
 
 
 class TestMCPTools(unittest.TestCase):

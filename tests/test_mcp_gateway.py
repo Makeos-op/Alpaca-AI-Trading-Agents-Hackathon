@@ -13,6 +13,7 @@ Covers:
 """
 
 import json
+import os
 import subprocess
 import unittest
 from datetime import date, datetime, timedelta, timezone
@@ -34,7 +35,9 @@ from src.execution.mcp_gateway import (
     MockMCPTransport,
     OptionOrderError,
     StdioMCPTransport,
+    StockOrderError,
     build_occ_symbol,
+    is_occ_symbol,
     parse_occ_symbol,
 )
 from src.options.models import OptionContract, OptionType
@@ -116,6 +119,33 @@ class TestToolDiscovery(unittest.TestCase):
         self.assertTrue(len(tools) >= 5)
         names = [t.name for t in tools]
         self.assertIn("get_account", names)
+
+    def test_stdio_mcp_toolsets_contains_assets(self):
+        """Verifica que ALPACA_TOOLSETS por defecto incluya 'assets' para habilitar get_clock y get_calendar."""
+        transport = StdioMCPTransport()
+        env = transport._build_env()
+        self.assertIn("ALPACA_TOOLSETS", env)
+        toolsets = env["ALPACA_TOOLSETS"].split(",")
+        self.assertIn("assets", toolsets)
+        self.assertIn("account", toolsets)
+        self.assertIn("trading", toolsets)
+        self.assertIn("options-data", toolsets)
+        self.assertIn("stock-data", toolsets)
+
+    def test_stdio_mcp_toolsets_custom_override(self):
+        """Verifica que se respete una variable de entorno ALPACA_TOOLSETS personalizada."""
+        custom_toolsets = "account,trading,assets"
+        transport = StdioMCPTransport(env={"ALPACA_TOOLSETS": custom_toolsets})
+        env = transport._build_env()
+        self.assertEqual(env["ALPACA_TOOLSETS"], custom_toolsets)
+
+    def test_stdio_mcp_transport_tool_discovery_includes_assets_tools(self):
+        """Verifica que list_tools en StdioMCPTransport reporte las herramientas oficiales requeridas."""
+        transport = StdioMCPTransport()
+        tools = transport.list_tools()
+        names = [t.name for t in tools]
+        for expected in ["get_clock", "get_calendar", "get_option_contracts", "place_stock_order", "place_option_order"]:
+            self.assertIn(expected, names)
 
 
 class TestCLITransport(unittest.TestCase):
@@ -244,6 +274,76 @@ class TestCLITransport(unittest.TestCase):
         with self.assertRaises(CLIExecutionError):
             cli.get_account()
 
+    def test_cli_is_authenticated_true_when_account_succeeds(self):
+        """Verifica que is_authenticated retorne True cuando alpaca account get responde exitosamente."""
+        cli = CLITransport(binary_path="/usr/bin/alpaca")
+        with patch.object(cli, "_run_cli", return_value={"id": "acc-123", "status": "ACTIVE"}):
+            self.assertTrue(cli.is_authenticated())
+
+    def test_cli_is_authenticated_fallback_to_clock(self):
+        """Verifica que is_authenticated intente alpaca clock si account get falla."""
+        cli = CLITransport(binary_path="/usr/bin/alpaca")
+        with patch.object(cli, "_run_cli", side_effect=[CLIExecutionError("account failed"), {"is_open": True}]):
+            self.assertTrue(cli.is_authenticated())
+
+    def test_cli_is_authenticated_false_when_all_fail(self):
+        """Verifica que is_authenticated retorne False si tanto account get como clock fallan."""
+        cli = CLITransport(binary_path="/usr/bin/alpaca")
+        with patch.object(cli, "_run_cli", side_effect=CLIExecutionError("auth failed")):
+            self.assertFalse(cli.is_authenticated())
+
+    def test_cli_auto_configure_profile_already_authenticated(self):
+        """Verifica que auto_configure_profile retorne True sin llamar subprocess si ya está autenticado."""
+        cli = CLITransport(binary_path="/usr/bin/alpaca")
+        with patch.object(cli, "is_authenticated", return_value=True):
+            with patch("subprocess.run") as mock_run:
+                result = cli.auto_configure_profile()
+                self.assertTrue(result)
+                mock_run.assert_not_called()
+
+    @patch("subprocess.run")
+    def test_cli_auto_configure_profile_executes_login_with_env_credentials(self, mock_run):
+        """Verifica que auto_configure_profile ejecute profile login --api-key con stdin canalizado."""
+        cli = CLITransport(binary_path="/usr/bin/alpaca")
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["/usr/bin/alpaca", "profile", "login", "--api-key"],
+            returncode=0,
+            stdout="Profile default created and activated",
+            stderr="",
+        )
+        with patch.object(cli, "is_authenticated", return_value=False):
+            with patch.dict(os.environ, {"APCA_API_KEY_ID": "TEST_KEY", "APCA_API_SECRET_KEY": "TEST_SECRET"}):
+                result = cli.auto_configure_profile()
+                self.assertTrue(result)
+                mock_run.assert_called_once()
+                call_kwargs = mock_run.call_args[1]
+                self.assertEqual(call_kwargs["input"], "TEST_KEY\nTEST_SECRET\n")
+                self.assertEqual(cli.env["APCA_API_KEY_ID"], "TEST_KEY")
+                self.assertEqual(cli.env["ALPACA_API_KEY"], "TEST_KEY")
+
+    def test_cli_auto_configure_profile_missing_credentials_returns_false(self):
+        """Verifica que auto_configure_profile retorne False si no existen credenciales en el entorno."""
+        cli = CLITransport(binary_path="/usr/bin/alpaca")
+        with patch.object(cli, "is_authenticated", return_value=False):
+            with patch.dict(os.environ, {}, clear=True):
+                result = cli.auto_configure_profile()
+                self.assertFalse(result)
+
+    @patch("subprocess.run")
+    def test_cli_auto_configure_profile_login_failure_returns_false(self, mock_run):
+        """Verifica que auto_configure_profile retorne False si el comando login devuelve código de error."""
+        cli = CLITransport(binary_path="/usr/bin/alpaca")
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["/usr/bin/alpaca", "profile", "login", "--api-key"],
+            returncode=1,
+            stdout="",
+            stderr="Invalid credentials",
+        )
+        with patch.object(cli, "is_authenticated", return_value=False):
+            with patch.dict(os.environ, {"APCA_API_KEY_ID": "BAD_KEY", "APCA_API_SECRET_KEY": "BAD_SECRET"}):
+                result = cli.auto_configure_profile()
+                self.assertFalse(result)
+
 
 class TestMockMCPTransport(unittest.TestCase):
     """Pruebas del transporte offline MockMCPTransport."""
@@ -365,6 +465,15 @@ class TestMockMCPTransport(unittest.TestCase):
         self.assertTrue(clock["timestamp"].startswith("2027-05-20"))
         self.assertTrue(clock["next_open"].startswith("2027-05-21"))
 
+    def test_mock_transport_get_calendar_executes_without_error(self):
+        """Verifica que MockMCPTransport.get_calendar devuelva días de mercado válidos."""
+        cal = self.transport.get_calendar(start="2026-09-01", end="2026-09-05")
+        self.assertIsInstance(cal, list)
+        self.assertGreater(len(cal), 0)
+        day = cal[0]
+        self.assertIn("date", day)
+        self.assertIn("open", day)
+        self.assertIn("close", day)
 
 
 class TestAlpacaGatewayFacade(unittest.TestCase):
@@ -388,6 +497,46 @@ class TestAlpacaGatewayFacade(unittest.TestCase):
         self.assertTrue(clock.is_open)
         self.assertTrue(len(clock.next_open) > 0)
         self.assertTrue(len(clock.next_close) > 0)
+
+    def test_gateway_get_calendar_executes_without_error(self):
+        """Verifica que AlpacaGateway.get_calendar retorne información del calendario sin error."""
+        cal = self.gateway.get_calendar(start="2026-09-01", end="2026-09-05")
+        self.assertIsInstance(cal, list)
+        self.assertGreater(len(cal), 0)
+        self.assertIn("date", cal[0])
+
+    def test_gateway_submit_stock_order_validates_and_executes(self):
+        """Verifica que submit_stock_order ejecute una orden de acciones válida."""
+        res = self.gateway.submit_stock_order(
+            symbol="SPY",
+            qty=10,
+            side="buy",
+            order_type="market",
+            time_in_force="day",
+        )
+        self.assertIsInstance(res, dict)
+        self.assertEqual(res["symbol"], "SPY")
+        self.assertEqual(res["qty"], "10")
+        self.assertEqual(res["side"], "buy")
+        self.assertEqual(res["status"], "filled")
+        self.assertTrue(len(res["order_id"]) > 0)
+
+    def test_gateway_submit_stock_order_zero_qty_raises_error(self):
+        """Verifica que submit_stock_order lance StockOrderError cuando qty <= 0."""
+        with self.assertRaises(StockOrderError):
+            self.gateway.submit_stock_order(symbol="SPY", qty=0, side="buy")
+
+    def test_gateway_submit_order_multi_asset_routing(self):
+        """Verifica que submit_order redirija a submit_stock_order o submit_option_order según OCC."""
+        # 1. Ticker de acciones -> place_stock_order / submit_stock_order
+        stk_res = self.gateway.submit_order(symbol="AAPL", qty=5, side="buy")
+        self.assertEqual(stk_res["symbol"], "AAPL")
+        self.assertEqual(stk_res["qty"], "5")
+
+        # 2. Símbolo OCC -> submit_option_order
+        opt_res = self.gateway.submit_order(symbol="SPY260930C00500000", qty=2, side="buy")
+        self.assertEqual(opt_res["symbol"], "SPY260930C00500000")
+        self.assertEqual(opt_res["qty"], "2")
 
     def test_get_option_chain_returns_typed_option_contracts(self):
         chain = self.gateway.get_option_chain("SPY", min_dte=5, max_dte=20)
@@ -534,6 +683,30 @@ class TestStdioMCPTransportRobustness(unittest.TestCase):
         mock_proc.stderr.close.assert_called_once()
         mock_proc.terminate.assert_called_once()
         self.assertIsNone(transport._proc)
+
+    def test_stdio_submit_order_multi_asset_routing(self):
+        """Verifica que StdioMCPTransport.submit_order despache place_stock_order vs place_option_order."""
+        transport = StdioMCPTransport()
+        with patch.object(transport, "call_tool", return_value={"status": "accepted"}) as mock_call:
+            # Orden de acciones / ETFs
+            transport.submit_order(symbol="SPY", qty=10, side="buy")
+            mock_call.assert_called_with("place_stock_order", {
+                "symbol": "SPY",
+                "qty": "10",
+                "side": "buy",
+                "type": "market",
+                "time_in_force": "day",
+            })
+
+            # Orden de opciones OCC
+            transport.submit_order(symbol="SPY260930C00500000", qty=3, side="buy")
+            mock_call.assert_called_with("place_option_order", {
+                "symbol": "SPY260930C00500000",
+                "qty": "3",
+                "side": "buy",
+                "type": "market",
+                "time_in_force": "day",
+            })
 
 
 
