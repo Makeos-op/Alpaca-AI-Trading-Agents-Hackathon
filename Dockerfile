@@ -3,8 +3,14 @@
 # Imagen de despliegue para el Alpaca AI Options Trading Agent.
 # Incluye Node.js/npx porque StdioMCPTransport lanza
 # `npx -y @alpacahq/mcp-server-alpaca` en tiempo de ejecución (R1).
+#
+# Build multi-stage: el stage `test` corre la suite completa como gate
+# (necesita ver tests/ y .devcontainer/, que test_f1_5_01 verifica como
+# parte del packaging del repo), pero NINGUNO de esos archivos de
+# desarrollo/test termina en la imagen final `runtime` — solo se copia
+# un marcador que prueba que el gate se ejecutó y pasó.
 
-FROM python:3.12-slim
+FROM python:3.12-slim AS base
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends nodejs npm ca-certificates \
@@ -16,15 +22,17 @@ COPY requirements.txt pyproject.toml ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
-COPY tests/ ./tests/
-# La suite verifica (F1.5-01) que el packaging del repo incluya el Dockerfile
-# que compila el CLI oficial de Alpaca (tier 2 de R1) — se empaqueta también
-# aquí para que ese check de integridad siga siendo válido dentro de la imagen.
-COPY .devcontainer/ ./.devcontainer/
 
-# Gate de build: la suite debe pasar al 100% (R4) antes de que la imagen sea usable.
+# ---- stage de test: gate de build (R4), no se incluye en la imagen final ----
+FROM base AS test
+COPY tests/ ./tests/
+COPY .devcontainer/ ./.devcontainer/
 # No requiere credenciales de Alpaca — corre 100% offline sobre MockMCPTransport.
-RUN python -m pytest tests/ -q
+RUN python -m pytest tests/ -q && touch /tests-passed
+
+# ---- stage final de runtime: solo código de producción ----
+FROM base AS runtime
+COPY --from=test /tests-passed /tests-passed
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
