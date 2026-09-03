@@ -76,13 +76,18 @@ class AccountSnapshot:
         if hasattr(tc_info, "__dict__"):
             raw = {k: str(v) for k, v in tc_info.__dict__.items() if not k.startswith("_")}
 
-        status_str = getattr(tc_info, "status", "ACTIVE")
+        status_raw = getattr(tc_info, "status", "ACTIVE")
+        status_val = str(getattr(status_raw, "value", status_raw)).upper()
+        
         is_active = (
-            getattr(tc_info, "is_active", None)
+            bool(getattr(tc_info, "is_active", False))
             if getattr(tc_info, "is_active", None) is not None
-            else (str(status_str).upper() == "ACTIVE")
+            else (status_val in ["ACTIVE", "APPROVED", "ONBOARDING", "ACCOUNTSTATUS.ACTIVE"] or "ACTIVE" in status_val)
         )
-        is_frozen = bool(getattr(tc_info, "is_frozen", False) or getattr(tc_info, "account_blocked", False))
+        is_frozen = bool(
+            getattr(tc_info, "is_frozen", False) is True
+            or getattr(tc_info, "account_blocked", False) is True
+        )
 
         return cls(
             account_id=str(getattr(tc_info, "account_id", getattr(tc_info, "id", ""))),
@@ -171,6 +176,49 @@ def get_account_snapshot(client: Optional[TradingClient] = None) -> AccountSnaps
         raise
     except Exception as exc:
         raise AccountConnectionError(f"Error al obtener información de cuenta: {exc}") from exc
+
+
+@dataclass(frozen=True)
+class MarketClockInfo:
+    """Información del reloj y horario oficial de mercado de Alpaca."""
+    is_open: bool
+    next_open: str
+    next_close: str
+    timestamp: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "is_open": self.is_open,
+            "next_open": self.next_open,
+            "next_close": self.next_close,
+            "timestamp": self.timestamp,
+        }
+
+
+def get_market_clock(client: Optional[TradingClient] = None) -> MarketClockInfo:
+    """
+    Consulta el estado en vivo del reloj del mercado en Alpaca.
+    """
+    if client is None:
+        client = get_trading_client()
+
+    try:
+        clock = client.get_clock()
+        return MarketClockInfo(
+            is_open=bool(getattr(clock, "is_open", False)),
+            next_open=str(getattr(clock, "next_open", "")),
+            next_close=str(getattr(clock, "next_close", "")),
+            timestamp=str(getattr(clock, "timestamp", "")),
+        )
+    except Exception:
+        # Fallback informativo si no se puede consultar el reloj
+        return MarketClockInfo(
+            is_open=False,
+            next_open="09:30 AM EST",
+            next_close="04:00 PM EST",
+            timestamp="",
+        )
+
 
 
 def calculate_trade_limits(

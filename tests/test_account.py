@@ -219,8 +219,9 @@ class TestValidateTradeCost(unittest.TestCase):
 class TestClientAndIntegration(unittest.TestCase):
     """Pruebas de inicialización y manejo de errores de cliente."""
 
+    @patch("src.account.load_dotenv")
     @patch.dict("os.environ", {}, clear=True)
-    def test_get_trading_client_missing_keys_raises_auth_error(self):
+    def test_get_trading_client_missing_keys_raises_auth_error(self, mock_load):
         with self.assertRaises(AccountAuthError):
             get_trading_client()
 
@@ -255,7 +256,21 @@ class TestClientAndIntegration(unittest.TestCase):
         with self.assertRaises(AccountConnectionError):
             get_account_snapshot(mock_client)
 
+    def test_get_market_clock(self):
+        mock_client = MagicMock()
+        mock_client.get_clock.return_value = SimpleNamespace(
+            is_open=True,
+            next_open="2026-09-04T09:30:00-04:00",
+            next_close="2026-09-03T16:00:00-04:00",
+            timestamp="2026-09-03T11:00:00-04:00",
+        )
+        from src.account import get_market_clock
+        clock_info = get_market_clock(mock_client)
+        self.assertTrue(clock_info.is_open)
+        self.assertEqual(clock_info.next_close, "2026-09-03T16:00:00-04:00")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
