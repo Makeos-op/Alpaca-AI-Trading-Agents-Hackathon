@@ -7,11 +7,15 @@ y expone funciones de interfaz de herramientas para agentes IA (MCP Tools).
 
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Optional
+
+logger = logging.getLogger("alpaca.executor")
+
 
 from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
 from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
@@ -301,6 +305,10 @@ class OptionExecutor:
                     f"Contrato de opción '{target_symbol}' no disponible en Alpaca Paper Trading ({err_str}). "
                     f"Ejecutando fallback determinista a acciones ({underlying})..."
                 )
+                print(
+                    f"  * [FALLBACK A ACCIONES] Opción '{target_symbol}' no disponible en Alpaca Paper Trading. "
+                    f"Ejecutando fallback determinista a acciones ({underlying})..."
+                )
                 try:
                     return self.fallback_to_equity(
                         proposal=proposal,
@@ -380,11 +388,27 @@ class OptionExecutor:
         re = risk_engine or RiskEngine()
         snap = account or self._get_gateway().get_account()
 
-        u_price = to_decimal(underlying_price) if underlying_price is not None else Decimal("500.00")
+        if underlying_price is not None:
+            u_price = to_decimal(underlying_price)
+        elif proposal.price is not None:
+            u_price = to_decimal(proposal.price)
+        elif proposal.contract is not None and proposal.contract.strike_price:
+            u_price = to_decimal(proposal.contract.strike_price)
+        else:
+            defaults = {
+                "AAPL": Decimal("185.00"),
+                "MSFT": Decimal("415.00"),
+                "NVDA": Decimal("125.00"),
+                "QQQ": Decimal("445.00"),
+                "SPY": Decimal("500.00"),
+            }
+            u_price = defaults.get(sym, Decimal("200.00"))
+
         qty = quantity if quantity is not None and quantity > 0 else max(1, proposal.quantity)
 
         equity_proposal = TradeProposal(
             symbol=sym,
+            underlying_symbol=sym,
             quantity=qty,
             strategy_name=f"{proposal.strategy_name}_EquityFallback",
             action=proposal.action or "BUY",
