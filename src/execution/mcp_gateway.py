@@ -1695,28 +1695,29 @@ class AlpacaGateway:
                 client_order_id=kwargs.get("client_order_id"),
             )
         except Exception as exc:
-            if self.mode == "auto" and not isinstance(self.transport, MockMCPTransport):
+            if self.mode == "auto" and isinstance(self.transport, StdioMCPTransport) and self.fallback_to_cli:
                 logger.warning(
-                    f"Transporte {type(self.transport).__name__} falló en submit_stock_order ({exc}). "
-                    f"Evaluando fallback..."
+                    f"Transporte StdioMCPTransport falló en submit_stock_order ({exc}). "
+                    f"Intentando fallback a CLITransport..."
                 )
-                if isinstance(self.transport, StdioMCPTransport) and self.fallback_to_cli:
-                    try:
-                        cli = CLITransport(binary_path=self.cli_path)
-                        cli.initialize()
-                        if not cli.is_authenticated():
-                            cli.auto_configure_profile()
-                        self.transport = cli
-                        return self.submit_stock_order(
-                            symbol=symbol,
-                            qty=qty,
-                            side=side,
-                            order_type=actual_type,
-                            time_in_force=actual_tif,
-                            **kwargs,
-                        )
-                    except Exception as cli_exc:
-                        logger.warning(f"Fallback a CLITransport falló ({cli_exc}). Activando MockMCPTransport.")
+                try:
+                    cli = CLITransport(binary_path=self.cli_path)
+                    cli.initialize()
+                    if not cli.is_authenticated():
+                        cli.auto_configure_profile()
+                    self.transport = cli
+                    return self.submit_stock_order(
+                        symbol=symbol,
+                        qty=qty,
+                        side=side,
+                        order_type=actual_type,
+                        time_in_force=actual_tif,
+                        **kwargs,
+                    )
+                except Exception as cli_exc:
+                    logger.error(f"Fallo en submit_stock_order vía CLITransport: {cli_exc}")
+                    raise StockOrderError(f"Error al enviar orden de acciones en broker: {cli_exc}") from cli_exc
+            elif self.mode == "mock" or isinstance(self.transport, MockMCPTransport):
                 self.transport = MockMCPTransport()
                 self.transport.initialize()
                 res = self.transport.submit_order(
@@ -1729,7 +1730,7 @@ class AlpacaGateway:
                     client_order_id=kwargs.get("client_order_id"),
                 )
             else:
-                raise
+                raise StockOrderError(f"Error al enviar orden de acciones en {type(self.transport).__name__}: {exc}") from exc
 
         if isinstance(res, dict):
             oid = str(res.get("order_id") or res.get("id") or "")
@@ -1776,28 +1777,29 @@ class AlpacaGateway:
                 client_order_id=kwargs.get("client_order_id"),
             )
         except Exception as exc:
-            if self.mode == "auto" and not isinstance(self.transport, MockMCPTransport):
+            if self.mode == "auto" and isinstance(self.transport, StdioMCPTransport) and self.fallback_to_cli:
                 logger.warning(
-                    f"Transporte {type(self.transport).__name__} falló en submit_option_order ({exc}). "
-                    f"Evaluando fallback..."
+                    f"Transporte StdioMCPTransport falló en submit_option_order ({exc}). "
+                    f"Intentando fallback a CLITransport..."
                 )
-                if isinstance(self.transport, StdioMCPTransport) and self.fallback_to_cli:
-                    try:
-                        cli = CLITransport(binary_path=self.cli_path)
-                        cli.initialize()
-                        if not cli.is_authenticated():
-                            cli.auto_configure_profile()
-                        self.transport = cli
-                        return self.submit_option_order(
-                            symbol=symbol,
-                            qty=qty,
-                            side=side,
-                            order_type=actual_type,
-                            time_in_force=actual_tif,
-                            **kwargs,
-                        )
-                    except Exception as cli_exc:
-                        logger.warning(f"Fallback a CLITransport falló ({cli_exc}). Activando MockMCPTransport.")
+                try:
+                    cli = CLITransport(binary_path=self.cli_path)
+                    cli.initialize()
+                    if not cli.is_authenticated():
+                        cli.auto_configure_profile()
+                    self.transport = cli
+                    return self.submit_option_order(
+                        symbol=symbol,
+                        qty=qty,
+                        side=side,
+                        order_type=actual_type,
+                        time_in_force=actual_tif,
+                        **kwargs,
+                    )
+                except Exception as cli_exc:
+                    logger.error(f"Fallo en submit_option_order vía CLITransport: {cli_exc}")
+                    raise OptionOrderError(f"Error al enviar orden de opción en broker: {cli_exc}") from cli_exc
+            elif self.mode == "mock" or isinstance(self.transport, MockMCPTransport):
                 self.transport = MockMCPTransport()
                 self.transport.initialize()
                 res = self.transport.submit_order(
@@ -1810,7 +1812,7 @@ class AlpacaGateway:
                     client_order_id=kwargs.get("client_order_id"),
                 )
             else:
-                raise
+                raise OptionOrderError(f"Error al enviar orden de opción en {type(self.transport).__name__}: {exc}") from exc
 
         if isinstance(res, dict):
             oid = str(res.get("order_id") or res.get("id") or "")

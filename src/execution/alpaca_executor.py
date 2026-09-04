@@ -241,6 +241,31 @@ class OptionExecutor:
 
                 order_id = str(order_dict.get("id") or order_dict.get("client_order_id") or f"order-{uuid.uuid4().hex[:8]}")
                 status = str(order_dict.get("status", "FILLED")).upper()
+
+                # Si el broker devolvió un estado de fallo o rechazo explícito
+                if status in ("REJECTED", "FAILED", "ERROR", "CANCELED") or "error" in order_dict:
+                    err_text = str(order_dict.get("error") or order_dict.get("message") or f"Orden con estado {status}")
+                    self.logger.log_rejected_trade(
+                        proposal=proposal,
+                        verdict=RiskVerdict(
+                            is_approved=False,
+                            trade_cost=verdict.trade_cost,
+                            max_allowed_budget=verdict.max_allowed_budget,
+                            portfolio_risk_pct_used=verdict.portfolio_risk_pct_used,
+                            reasons=[f"Broker Alpaca rechazó la orden: {err_text}"],
+                            warnings=verdict.warnings,
+                        ),
+                        mode=current_mode,
+                    )
+                    return ExecutionResult(
+                        success=False,
+                        order_id=order_id,
+                        symbol=target_symbol,
+                        quantity=proposal.quantity,
+                        status="REJECTED",
+                        error_message=f"Broker Alpaca rechazó la orden: {err_text}",
+                    )
+
                 raw_fill = order_dict.get("filled_avg_price") or limit_price or ref_ask
                 fill_price = to_decimal(raw_fill)
 
@@ -262,6 +287,33 @@ class OptionExecutor:
             )
 
         except Exception as exc:
+            err_str = str(exc)
+            # Si una orden de opción falla porque el contrato no existe en Alpaca ("not found" o 422),
+            # y no estamos en dry-run, ejecutar el fallback determinista a acciones de forma automática
+            if not is_equity and not is_dry and ("not found" in err_str.lower() or "422" in err_str):
+                underlying = (
+                    getattr(proposal, "underlying_symbol", None)
+                    or (proposal.contract.underlying_symbol if proposal.contract else None)
+                    or (target_symbol[:4].rstrip("0123456789CP") if target_symbol else "AAPL")
+                    or "AAPL"
+                )
+                logger.warning(
+                    f"Contrato de opción '{target_symbol}' no disponible en Alpaca Paper Trading ({err_str}). "
+                    f"Ejecutando fallback determinista a acciones ({underlying})..."
+                )
+                try:
+                    return self.fallback_to_equity(
+                        proposal=proposal,
+                        account=None,
+                        fallback_symbol=underlying,
+                        quantity=1,
+                        use_limit_order=use_limit_order,
+                        limit_price=limit_price,
+                        dry_run=is_dry,
+                    )
+                except Exception as fb_exc:
+                    exc = fb_exc
+
             asset_label = "acciones" if is_equity else "opciones"
             error_msg = f"Error al emitir orden de {asset_label} en Alpaca: {exc}"
             self.logger.log_rejected_trade(
@@ -351,6 +403,9 @@ class OptionExecutor:
             limit_price=limit_price,
             dry_run=dry_run,
         )
+
+    # Alias de método para conveniencia de llamada
+    execute_equity_fallback = fallback_to_equity
 
 
 # Alias unificados para la capa de ejecución multi-activo
