@@ -8,13 +8,14 @@ Diseñado para desplegarse **automáticamente en Vercel con cero configuración*
 
 ## 🚀 Despliegue Automático en Vercel
 
-### Opción 1: Conectar Repositorio de GitHub en Vercel (Recomendado)
+### Configuración en Vercel
 1. Inicia sesión en [Vercel](https://vercel.com).
 2. Haz clic en **"Add New Project"** e importa este repositorio de GitHub.
-3. Vercel detectará automáticamente la configuración definida en `vercel.json` en la raíz.
-4. *(Opcional)* Si prefieres configurar manualmente el directorio raíz:
-   - En **Root Directory**, selecciona la carpeta `web`.
-   - Vercel reconocerá el framework como **Next.js**.
+3. En la pantalla de configuración de importación (o en **Project Settings -> General**):
+   - **Root Directory**: Haz clic en **Edit** y selecciona la carpeta `web`.
+   - Vercel reconocerá automáticamente el framework como **Next.js**.
+4. En **Build & Development Settings**:
+   - Mantén los valores predeterminados (todos los toggles apagados: Build Command `next build`, Output Directory `.next`, Install Command `npm install`).
 5. Haz clic en **"Deploy"**. En ~1 minuto la web estará pública y lista.
 
 ### Variables de Entorno Opcionales en Vercel
